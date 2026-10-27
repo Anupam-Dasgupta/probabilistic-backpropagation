@@ -863,6 +863,7 @@ def environment_metadata(device: torch.device | str) -> dict[str, Any]:
         "cuda_runtime": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),
         "device_type": selected.type,
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         "matmul_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
         "cudnn_tf32": bool(torch.backends.cudnn.allow_tf32),
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
@@ -1411,3 +1412,216 @@ def copy_file_verified(
         {"sha256": digest, "size_bytes": size, "source_name": source.name},
     )
     return destination
+
+
+def backup_resume_snapshot(
+    run_directory: str | os.PathLike[str],
+    persistence_directory: str | os.PathLike[str],
+    checkpoint: str | os.PathLike[str],
+) -> Path:
+    """Back up one committed epoch's complete recovery metadata.
+
+    The checkpoint is copied and verified first. Every support file is copied
+    to an epoch-specific snapshot, and snapshot.ready.json is written last.
+    An interrupted snapshot cannot replace a previously valid recovery point.
+    """
+
+    run = Path(run_directory)
+    remote = Path(persistence_directory)
+    source_checkpoint = Path(checkpoint)
+
+    remote_checkpoint = copy_checkpoint_verified(
+        source_checkpoint, remote / "checkpoints"
+    )
+
+    commit = json.loads(
+        source_checkpoint.with_suffix(
+            source_checkpoint.suffix + ".commit.json"
+        ).read_text(encoding="utf-8")
+    )
+    sequence = int(commit["checkpoint_sequence"])
+
+    snapshot = remote / "snapshots" / f"checkpoint_{sequence:06d}"
+    ready_path = snapshot / "snapshot.ready.json"
+
+    if ready_path.exists():
+        raise FileExistsError(
+            f"Recovery snapshot already committed: {ready_path}"
+        )
+
+    required = (
+        "manifest.json",
+        "checkpoint_journal.json",
+        "timing.json",
+        "epochs.csv",
+        "controller_events.csv",
+        "summary.json",
+        "masks.npz",
+        "mask_manifest.json",
+        "errors.jsonl",
+    )
+    optional = (
+        "calibration.json",
+        "replay_provenance.json",
+        "schedule_provenance.json",
+        "final_predictor.pt",
+    )
+
+    files = {}
+
+    for name in required + optional:
+        source = run / name
+
+        if not source.exists():
+            if name in required:
+                raise FileNotFoundError(
+                    f"Required recovery file missing: {source}"
+                )
+            continue
+
+        copied = copy_file_verified(source, snapshot / name)
+        files[name] = {
+            "sha256": sha256_file(copied),
+            "size_bytes": copied.stat().st_size,
+        }
+
+    ready = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run.name,
+        "checkpoint_sequence": sequence,
+        "checkpoint_file": remote_checkpoint.name,
+        "checkpoint_sha256": commit["sha256"],
+        "files": files,
+    }
+
+    atomic_write_json(ready_path, ready)
+    return ready_path
+
+
+def restore_resume_snapshot(
+    persistence_directory: str | os.PathLike[str],
+    run_directory: str | os.PathLike[str],
+) -> Path:
+    """Restore the newest completely verified recovery snapshot.
+
+    Only snapshots with a ready marker and matching file/checkpoint hashes are
+    eligible. Restores into a fresh local directory. Never overwrites a run.
+    """
+
+    remote = Path(persistence_directory)
+    local = Path(run_directory)
+
+    if local.exists():
+        raise FileExistsError(
+            f"Recovery destination must not exist: {local}"
+        )
+
+    candidates = sorted(
+        (remote / "snapshots").glob(
+            "checkpoint_*/snapshot.ready.json"
+        ),
+        reverse=True,
+    )
+
+    selected = None
+
+    for ready_path in candidates:
+        try:
+            ready = json.loads(ready_path.read_text(encoding="utf-8"))
+
+            if (
+                ready["schema_version"] != SCHEMA_VERSION
+                or ready["run_id"] != local.name
+            ):
+                continue
+
+            checkpoint = remote / "checkpoints" / ready["checkpoint_file"]
+            checkpoint_commit = checkpoint.with_suffix(
+                checkpoint.suffix + ".commit.json"
+            )
+
+            if not checkpoint.is_file() or not checkpoint_commit.is_file():
+                continue
+
+            commit = json.loads(
+                checkpoint_commit.read_text(encoding="utf-8")
+            )
+
+            if (
+                sha256_file(checkpoint) != ready["checkpoint_sha256"]
+                or commit["sha256"] != ready["checkpoint_sha256"]
+                or int(commit["checkpoint_sequence"])
+                != int(ready["checkpoint_sequence"])
+                or checkpoint.stat().st_size != int(commit["size_bytes"])
+            ):
+                continue
+
+            for name, identity in ready["files"].items():
+                source = ready_path.parent / name
+                marker = source.with_suffix(
+                    source.suffix + ".commit.json"
+                )
+
+                if not source.is_file() or not marker.is_file():
+                    raise ValueError("Missing recovery support file or marker")
+
+                file_commit = json.loads(
+                    marker.read_text(encoding="utf-8")
+                )
+
+                if (
+                    sha256_file(source) != identity["sha256"]
+                    or source.stat().st_size != identity["size_bytes"]
+                    or file_commit["sha256"] != identity["sha256"]
+                    or file_commit["size_bytes"] != identity["size_bytes"]
+                ):
+                    raise ValueError("Recovery support checksum mismatch")
+
+            selected = (ready, ready_path.parent, checkpoint)
+            break
+
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+
+    if selected is None:
+        raise RuntimeError("No completely verified recovery snapshot found")
+
+    ready, snapshot, checkpoint = selected
+    staging = local.with_name(f".{local.name}.restore.partial")
+
+    if staging.exists():
+        raise FileExistsError(
+            f"Remove abandoned recovery staging manually: {staging}"
+        )
+
+    staging.mkdir(parents=True)
+
+    try:
+        (staging / "checkpoints").mkdir()
+        destination = staging / "checkpoints" / checkpoint.name
+
+        shutil.copyfile(checkpoint, destination)
+        shutil.copyfile(
+            checkpoint.with_suffix(checkpoint.suffix + ".commit.json"),
+            destination.with_suffix(destination.suffix + ".commit.json"),
+        )
+
+        if sha256_file(destination) != ready["checkpoint_sha256"]:
+            raise IOError("Restored checkpoint failed checksum validation")
+
+        for name, identity in ready["files"].items():
+            destination = staging / name
+            shutil.copyfile(snapshot / name, destination)
+
+            if sha256_file(destination) != identity["sha256"]:
+                raise IOError(f"Restored file failed checksum: {name}")
+
+        local.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, local)
+
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    return local
+

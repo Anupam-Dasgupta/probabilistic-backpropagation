@@ -379,6 +379,36 @@ to the original local run layout. Resume with both execution flags and the same
 runs may contribute accuracy evidence after equivalence checks but are not clean
 uninterrupted timing benchmarks.
 
+
+### Verified epoch recovery snapshots
+
+When `--persistence-dir` is enabled, every completed epoch writes:
+
+- A checksum-verified immutable checkpoint and commit marker.
+- An epoch-specific snapshot of run metadata and derived outputs.
+- A `snapshot.ready.json` marker published only after all support files are verified.
+
+The recovery workflow selects the newest fully verified snapshot and restores
+it into a fresh local run directory. It never overwrites existing local state.
+
+Immutable resolved configs and dataset split artifacts are backed up separately
+under `_study_support`.
+
+The notebook distinguishes three cases:
+
+1. Fresh run: execute `run`.
+2. Existing incomplete local run: execute `resume`.
+3. New Colab session: restore support files and a verified snapshot, then
+   explicitly authorize `resume`.
+
+A different execution fingerprint remains an incompatibility. An interrupted
+or resumed run is not an uninterrupted timing replicate.
+
+Current timing ledgers do not charge the additional versioned metadata-snapshot
+transfer. Persistence-enabled runs must disclose that missing overhead and
+must not support fully accounted workflow speed claims until it is measured.
+
+
 ### 8. Read-only analysis
 
 ```bash

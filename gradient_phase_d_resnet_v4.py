@@ -64,6 +64,8 @@ from phase_d_v4_io import (
     sha256_file,
     validate_output_root,
     validate_config,
+    backup_resume_snapshot,
+    restore_resume_snapshot,
 )
 from phase_d_v4_diagnostics import (
     gradient_metrics,
@@ -1110,9 +1112,30 @@ def configure_determinism(config: RunConfig, device: torch.device | str) -> None
 
     selected = torch.device(device)
     execution = config.values["execution"]
+
+    
     if selected.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable; CPU fallback is disabled")
+        raise RuntimeError(
+            "CUDA was requested but is unavailable; CPU fallback is disabled"
+        )
+
+    if selected.type == "cuda":
+        workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+
+        if workspace is None:
+            if torch.cuda.is_initialized():
+                raise RuntimeError(
+                    "CUDA was initialized before CUBLAS_WORKSPACE_CONFIG "
+                    "was set. Restart the Python process."
+                )
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+        elif workspace not in {":4096:8", ":16:8"}:
+            raise RuntimeError(
+                "Unsupported CUBLAS_WORKSPACE_CONFIG for strict determinism"
+            )
     torch.backends.cudnn.benchmark = bool(execution["cudnn_benchmark"])
+    
     torch.backends.cudnn.deterministic = bool(execution["cudnn_deterministic"])
     torch.backends.cuda.matmul.allow_tf32 = bool(execution["matmul_tf32"])
     torch.backends.cudnn.allow_tf32 = bool(execution["cudnn_tf32"])
@@ -2347,6 +2370,12 @@ def _commit_epoch(
             journal_record["io_seconds"] = total_io_seconds
     atomic_write_json(journal_path, journal)
     atomic_write_json(run_directory / "timing.json", ledger.to_dict())
+    if context.get("persistence_directory") is not None:
+        backup_resume_snapshot(
+            run_directory,
+            context["persistence_directory"],
+            checkpoint_path,
+        )
     return checkpoint_path
 
 
@@ -2550,6 +2579,44 @@ def resume_run(
     ):
         raise ValueError("post-warm feedback checkpoint lacks controller state")
     state = run_state_from_dict(payload["run_state"])
+
+    # The checkpoint cannot contain its own SHA-256 because that hash
+    # is only known after serialization. Restore it from the verified
+    # checkpoint commit metadata before continuing training.
+    current_sequence = int(payload["checkpoint_sequence"])
+    current_hash = payload["resume_metadata"]["checkpoint_sha256"]
+
+    matching_records = [
+        row for row in state.epoch_records
+        if int(row["checkpoint_sequence"]) == current_sequence
+    ]
+    if len(matching_records) != 1:
+        raise ValueError(
+            "Expected exactly one epoch record for resumed checkpoint"
+        )
+
+    recorded_hash = matching_records[0].get("checkpoint_sha256", "")
+    if recorded_hash not in ("", current_hash):
+        raise ValueError(
+            "Epoch record checkpoint hash conflicts with verified checkpoint"
+        )
+
+    matching_records[0]["checkpoint_sha256"] = current_hash
+
+    # An older missing hash must never be silently accepted.
+    for row in state.epoch_records:
+        digest = row.get("checkpoint_sha256", "")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError(
+                "Earlier epoch has missing checkpoint identity"
+            )
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise ValueError(
+                "Earlier epoch has invalid checkpoint identity"
+            ) from exc
+
     if state.pending_quota != int(payload["pending_quota"]):
         raise ValueError("pending quota mismatch inside checkpoint")
     if _mask_prefix_hash(state.executed_exact_mask) != payload["executed_mask_sha256"]:
@@ -3087,6 +3154,7 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     smoke.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     smoke.add_argument("--out", required=True)
     smoke.add_argument("--stop-after-global-epoch", type=int)
+    smoke.add_argument("--persistence-dir")
     resume = subparsers.add_parser(
         "resume", help="resume a synthetic workflow or one explicit scientific run"
     )
@@ -3215,7 +3283,6 @@ def main(arguments: list[str] | None = None) -> int:
         value is not None
         for value in (
             args.data_dir, args.split_file, args.mask, args.mask_manifest,
-            args.persistence_dir,
         )
     ):
         raise ValueError("synthetic resume must not receive scientific data or mask arguments")
@@ -3232,6 +3299,7 @@ def main(arguments: list[str] | None = None) -> int:
             artifacts=artifacts,
             data_identities=identities,
             stop_after_global_epoch=args.stop_after_global_epoch,
+            persistence_directory=args.persistence_dir,
         )
     elif args.command == "resume":
         resume_run(
@@ -3243,6 +3311,7 @@ def main(arguments: list[str] | None = None) -> int:
             artifacts=artifacts,
             data_identities=identities,
             checkpoint_path=args.checkpoint,
+            persistence_directory=args.persistence_dir,
         )
     print(f"Synthetic {args.command} completed: {output}")
     return 0

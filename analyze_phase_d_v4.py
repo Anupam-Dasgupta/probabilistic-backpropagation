@@ -924,12 +924,39 @@ def verify_resume_equivalence(
     right = load_checkpoint(
         latest_committed_checkpoint(Path(resumed_directory) / "checkpoints")
     )
+
+    # Compare actual serialized training-state fields.
+    # Timing, checkpoint content hashes, run-specific records and
+    # interruption history are deliberately excluded.
     state_fields = (
-        "completed_epoch", "next_epoch", "completed", "scale", "pending_quota",
-        "postwarm_step", "mask_cursor", "counters", "executed_exact_mask",
-        "executed_head_mask", "replay_schedule_mask", "replay_epoch_offsets",
-        "data_order_hashes", "target_attainment",
+        "stage",
+        "completed_epoch",
+        "next_epoch",
+        "completed",
+        "global_step",
+        "postwarm_step",
+        "pending_quota",
+        "exact_trunk_backwards",
+        "synthetic_backwards",
+        "zero_backwards",
+        "skipped_slots",
+        "trunk_optimizer_steps",
+        "head_optimizer_steps",
+        "predictor_fits",
+        "predictor_inferences",
+        "scale",
+        "lr_global_epoch",
+        "mask_cursor",
+        "executed_exact_mask",
+        "executed_head_mask",
+        "replay_schedule_mask",
+        "replay_epoch_offsets",
+        "mask_epoch_offsets",
+        "checkpoint_sequence",
+        "data_order_hashes",
+        "target_attainment",
     )
+
     fields = {
         "model": _state_tree_equal(left["model"], right["model"]),
         "predictor": _state_tree_equal(left["predictor"], right["predictor"]),
