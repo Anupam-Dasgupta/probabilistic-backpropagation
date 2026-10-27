@@ -1,0 +1,103 @@
+{
+  "schema_version": "phase_d_v4.m0.1",
+  "status": "prepared_not_launched_requires_user_approval_after_colab_preflight",
+  "study_id": "phase_d_v4_pilot_seed0",
+  "scientific_scope": {
+    "classifier_seeds": [0],
+    "warmup_epochs": 4,
+    "postwarm_epochs": 12,
+    "total_epochs": 16,
+    "batch_size": 32,
+    "training_batches_per_epoch": 1407,
+    "gap_permutation_replicas": [0],
+    "final_test_loaded": false,
+    "precision": "fp32",
+    "device_required": "NVIDIA T4",
+    "exploratory_one_seed_only": true
+  },
+  "trajectory_accounting": {
+    "donor_generation_trajectories": 1,
+    "replay_equivalence_trajectories": 1,
+    "randomized_measured_trajectories": 11,
+    "actual_full_trajectory_count": 13,
+    "bounded_preflight_plain_warmup_only_trajectories": 1,
+    "plain_warmup_full_trajectory_attribution_count": 2,
+    "predictor_warmup_full_trajectory_attribution_count": 11,
+    "independent_classifier_seed_count": 1,
+    "gap_replicas_are_independent_seeds": false,
+    "profiles_are_full_trajectories": false
+  },
+  "dependency_phase": [
+    {
+      "run_id": "seed0_relative_feedback_donor",
+      "method": "relative_feedback",
+      "purpose": "generate_verified_source_mask",
+      "depends_on": [],
+      "counted_as_measured_block": false
+    },
+    {
+      "run_id": "seed0_relative_replay_learned_equivalence",
+      "method": "relative_replay_learned",
+      "purpose": "same_environment_donor_trajectory_equivalence_check",
+      "depends_on": ["seed0_relative_feedback_donor"],
+      "independent_scientific_condition": false,
+      "counted_as_measured_block": false
+    }
+  ],
+  "measured_conditions": [
+    {"run_id": "seed0_exact_frozen", "method": "exact", "group": "accuracy_reference", "depends_on": [], "retrospective": false, "deployment_eligible": true},
+    {"run_id": "seed0_exact_standard_bn", "method": "exact_standard_bn", "group": "accuracy_reference", "depends_on": [], "retrospective": false, "deployment_eligible": true},
+    {"run_id": "seed0_relative_feedback_measured", "method": "relative_feedback", "group": "candidate_history", "depends_on": ["seed0_relative_feedback_donor_mask_equality"], "retrospective": false, "deployment_eligible": true},
+    {"run_id": "seed0_scheduled", "method": "scheduled", "group": "candidate_history", "depends_on": [], "retrospective": false, "deployment_eligible": true},
+    {"run_id": "seed0_relative_replay_zero_shadow", "method": "relative_replay_zero_shadow", "group": "predictor_attribution", "depends_on": ["seed0_relative_feedback_donor"], "retrospective": true, "deployment_eligible": false},
+    {"run_id": "seed0_relative_replay_skip_shadow", "method": "relative_replay_skip_shadow", "group": "predictor_attribution", "depends_on": ["seed0_relative_feedback_donor"], "retrospective": true, "deployment_eligible": false},
+    {"run_id": "seed0_relative_replay_exact_trunk", "method": "relative_replay_exact_trunk", "group": "predictor_attribution", "depends_on": ["seed0_relative_feedback_donor"], "retrospective": true, "deployment_eligible": false},
+    {"run_id": "seed0_relative_periodic_epoch", "method": "relative_periodic_epoch", "group": "controller_attribution", "depends_on": ["seed0_relative_feedback_donor"], "retrospective": true, "deployment_eligible": false},
+    {"run_id": "seed0_relative_gap_permutation_epoch_r0", "method": "relative_gap_permutation_epoch", "mask_replicate": 0, "group": "controller_attribution", "depends_on": ["seed0_relative_feedback_donor"], "retrospective": true, "deployment_eligible": false},
+    {"run_id": "seed0_relative_periodic_total", "method": "relative_periodic_total", "group": "budget_allocation_required_pilot", "depends_on": ["seed0_relative_feedback_donor"], "retrospective": true, "deployment_eligible": false},
+    {"run_id": "seed0_fixed_frontloaded_learned", "method": "fixed_frontloaded", "synthetic_behavior": "learned", "group": "budget_allocation_required_pilot", "depends_on": [], "retrospective": false, "deployment_eligible": true}
+  ],
+  "run_order": {
+    "ordering_seed": 73001,
+    "construction": "private_rng_randomized_after_donor_phase",
+    "pre_block_profile": "plain_exact_identical_profile",
+    "measured_block": [
+      "seed0_relative_periodic_epoch",
+      "seed0_relative_replay_skip_shadow",
+      "seed0_fixed_frontloaded_learned",
+      "seed0_relative_gap_permutation_epoch_r0",
+      "seed0_relative_replay_zero_shadow",
+      "seed0_relative_periodic_total",
+      "seed0_exact_standard_bn",
+      "seed0_scheduled",
+      "seed0_exact_frozen",
+      "seed0_relative_replay_exact_trunk",
+      "seed0_relative_feedback_measured"
+    ],
+    "post_block_profile": "plain_exact_identical_profile",
+    "hardware_drift_threshold_fraction": 0.1,
+    "automatic_retry": false
+  },
+  "resource_estimate": {
+    "status": "unavailable_until_bounded_t4_preflight_and_donor_mask_complete",
+    "estimated_gpu_hours": null,
+    "estimated_storage_bytes": null,
+    "required_inputs": [
+      "T4_profile_summary_with_plain_exact_exact_plus_predictor_learned_zero_shadow_skip_shadow_and_controller_overhead",
+      "measured_plain_and_predictor_warmup_times",
+      "donor_exact_mask_slot_counts",
+      "validation_checkpoint_and_log_IO_measurements",
+      "committed_checkpoint_size_bytes"
+    ],
+    "counts_are_not_flops": true,
+    "not_a_runtime_claim": true
+  },
+  "approval_gate": {
+    "required_before_full_pilot": true,
+    "requires_concrete_measured_runtime_and_storage_estimate": true,
+    "five_seed_study_authorized": false,
+    "optional_ablations_authorized": false,
+    "automatic_retries_authorized": false,
+    "parameter_sweeps_authorized": false
+  }
+}

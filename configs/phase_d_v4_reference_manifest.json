@@ -1,0 +1,64 @@
+{
+  "schema_version": "phase_d_v4.m0.1",
+  "reference_config": {
+    "path": "configs/phase_d_v4_reference.json",
+    "sha256": "796aef440a0c1ac5ef578641267c045fdf29534ea5e77805b5253dd3548d60c9"
+  },
+  "scientific_fingerprint": {
+    "sha256": "906faef9724e56e05f5fb7b45e7b471b55b822168b3d6f7702ffd9ee4ddf0d4e",
+    "artifact_keys": ["split_contract", "v3_results", "v3_source"]
+  },
+  "governing_artifacts": {
+    "AGENTS.md": {"sha256": "6d343b0a158e74fc812ba11c2b349952bc6c7baa31c937c2dc6cb17c345e580d", "size_bytes": 4955},
+    "IMPLEMENTATION_PLAN.md": {"sha256": "6824bab7855318d097672d67da6301a7a0bbb9eace90b37659b32d0fb95030d0", "size_bytes": 80400},
+    "RESEARCH_SPEC.md": {"sha256": "bf0f6a77305f0afc7e3e259590b17831bb09fccfd34c6ad535807e1094aa34b4", "size_bytes": 52819},
+    "gradient_phase_d_resnet_v3.py": {"sha256": "aa035009b5a77975f8ec6ab8d1b36f912db87e848418ed656a28e84a7cdef914", "size_bytes": 36985}
+  },
+  "reference_results": {
+    "path": "cifar_d_resnet_v3",
+    "tree_hash_algorithm": "sha256(canonical_json(sorted_recursive_file_entries_with_path_size_sha256))",
+    "tree_sha256": "0362d098a43a0d2376358229b3a90d33db5f8d3ec01ef71b615df0fec0a606ab",
+    "file_count": 44,
+    "total_size_bytes": 1080510472
+  },
+  "split_identity": {
+    "kind": "declared_contract_hash",
+    "note": "M0 hashes the split contract without loading data; materialized index-array hashes are required when data construction is implemented in a later authorized milestone.",
+    "sha256": "6dcbdb1dbe4c1ce6f2abffa1c457c641c26fec282cbb45fe271f11e445f92ac6"
+  },
+  "issue_register_owners": {
+    "S1": ["M5"],
+    "S2": ["M5", "M6"],
+    "S3": ["M1", "M3"],
+    "S4": ["M4"],
+    "S5": ["M2", "M3", "M6"],
+    "S6": ["M1", "M3"],
+    "S7": ["M1", "M3", "M5"],
+    "S8": ["M3"],
+    "S9": ["M0", "M1", "M2", "M3"],
+    "S10": ["M1", "M3"],
+    "S11": ["M0", "M2", "M4"],
+    "S12": ["M2", "M6"],
+    "S13": ["M6", "M7"],
+    "S14": ["M7"],
+    "S15": ["M3"],
+    "A1": ["M1", "M4"],
+    "A2": ["M6"],
+    "A3": ["M5"],
+    "A4": ["M1", "M3", "M5"],
+    "A5": ["M2"],
+    "A6": ["M6"],
+    "A7": ["M1", "M6"],
+    "A8": ["M1"],
+    "A9": ["M3"],
+    "A10": ["M2", "M6"],
+    "A11": ["M4", "M6"],
+    "A12": ["M0", "M6", "M7"],
+    "A13": ["M2", "M3"],
+    "A14": ["M4", "M5", "M6", "M7"],
+    "A15": ["M2", "M3"],
+    "A16": ["M0", "M2"],
+    "A17": ["M0", "M7"],
+    "A18": ["M7"]
+  }
+}

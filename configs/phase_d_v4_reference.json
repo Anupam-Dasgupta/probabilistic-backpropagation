@@ -1,0 +1,249 @@
+{
+  "schema_version": "phase_d_v4.m0.1",
+  "scientific": {
+    "identity": {
+      "protocol": "phase_d_v4_reference",
+      "classifier_seed": 0,
+      "mask_replicate": null,
+      "method": "exact",
+      "algorithm_version": "v3",
+      "normalization": "frozen_head_postwarm",
+      "synthetic_behavior": "exact",
+      "mask_role": "none",
+      "mask_sha256": null,
+      "retrospective": false,
+      "deployment_eligible": true
+    },
+    "data": {
+      "dataset": "CIFAR10",
+      "source_partition": "official_train_only",
+      "dataset_size": 50000,
+      "split_seed": 71503,
+      "split_algorithm": "torch.randperm_cpu_default_generator",
+      "validation_selector": "permutation[0:5000]",
+      "training_selector": "permutation[5000:50000]",
+      "training_size": 45000,
+      "validation_size": 5000,
+      "final_test_loaded": false,
+      "train_transform": [
+        {"name": "RandomCrop", "size": 32, "padding": 4},
+        {"name": "RandomHorizontalFlip", "probability": 0.5},
+        {"name": "ToTensor"},
+        {"name": "Normalize", "mean": [0.4914, 0.4822, 0.4465], "std": [0.2470, 0.2435, 0.2616]}
+      ],
+      "validation_transform": [
+        {"name": "ToTensor"},
+        {"name": "Normalize", "mean": [0.4914, 0.4822, 0.4465], "std": [0.2470, 0.2435, 0.2616]}
+      ]
+    },
+    "model": {
+      "architecture": "cifar_resnet18",
+      "width": 64,
+      "blocks_per_stage": 2,
+      "stem": "3x3_stride1_padding1",
+      "split_after": "layer2",
+      "boundary_shape": [null, 128, 16, 16],
+      "classes": 10
+    },
+    "predictor": {
+      "architecture": "label_embedding_1x1_depthwise3x3_1x1",
+      "input_channels": 128,
+      "bottleneck_width": 32,
+      "label_embedding_classes": 10,
+      "activations": "relu_after_first_and_depthwise",
+      "convolution_biases": true,
+      "detach_boundary_input": true
+    },
+    "training": {
+      "warmup_epochs": 4,
+      "postwarm_epochs": 12,
+      "total_epochs": 16,
+      "batch_size": 32,
+      "drop_last": false,
+      "expected_training_batches_per_epoch": 1407,
+      "expected_final_batch_size": 8
+    },
+    "optimizers": {
+      "trunk": {"name": "SGD", "lr_start": 0.04, "momentum": 0.9, "weight_decay": 0.0005, "dampening": 0.0, "nesterov": false},
+      "head": {"name": "SGD", "lr_start": 0.04, "momentum": 0.9, "weight_decay": 0.0005, "dampening": 0.0, "nesterov": false},
+      "predictor": {"name": "AdamW", "lr": 0.0008, "weight_decay": 0.0001, "betas": [0.9, 0.999], "eps": 1e-8}
+    },
+    "learning_rate": {
+      "clock": "global_epoch",
+      "schedule": "v3_cosine",
+      "lr_start": 0.04,
+      "lr_min": 0.001,
+      "formula": "lr_min+0.5*(lr_start-lr_min)*(1+cos(pi*min(e,max(0,H-1))/max(1,H-1)))",
+      "reset_after_warmup": false,
+      "sparse_step_compensation": false
+    },
+    "gradient_contract": {
+      "classifier_loss_reduction": "mean",
+      "target": "batch_size*dL_dh/scale",
+      "injection": "scale*predictor_output/batch_size",
+      "scale_source": "first_warmup_batch_initialized_eval_model_summed_ce_boundary_gradient_rms",
+      "scale_floor": 1e-6,
+      "predictor_objective": "coordinate_mse_plus_weighted_per_example_cosine_loss",
+      "cosine_weight": 0.2,
+      "valid_target_flat_norm_floor": 1e-5,
+      "cosine_eps": 1e-8,
+      "global_l2_clip": 5.0,
+      "exact_clip_group": "joint_trunk_head",
+      "synthetic_clip_group": "trunk_only",
+      "clip_before_optimizer_weight_decay": true,
+      "historical_predictor_evaluations_per_exact_fit": 2
+    },
+    "normalization_contract": {
+      "warmup": "all_batchnorm_train",
+      "frozen_head_postwarm": "trunk_batchnorm_train_head_batchnorm_eval_affine_trainable",
+      "standard_bn": "all_classifier_batchnorm_train_on_exact_batches",
+      "validation": "all_batchnorm_eval",
+      "synthetic_paths_execute_head": false,
+      "normalization_parity_with_conventional_exact_claimed": false
+    },
+    "controller": {
+      "history_window": 96,
+      "low_quantile": 0.33,
+      "high_quantile": 0.67,
+      "maximum_quota": 4,
+      "allowed_quotas": [0, 2, 4],
+      "relative_error": "batch_global_rmse/max(batch_global_target_rms,0.05)",
+      "relative_denominator_floor": 0.05,
+      "relative_quantile_interpolation": "numpy_linear",
+      "relative_threshold_history": "previous_exact_batches_only",
+      "absolute_thresholds": "fixed_calibration_quantiles",
+      "ema_old_value_weight": 0.25,
+      "emergency_multiplier": 2.0,
+      "quota_persists_across_epochs": true,
+      "scheduled_ratios": [4, 3, 2, 1],
+      "scheduled_step_clock": "global_postwarm_step"
+    },
+    "schedule_contract": {
+      "mask_dtype": "boolean",
+      "mask_true_meaning": "exact_or_head_update_as_named_by_mask_role",
+      "mask_identity_hash": "sha256(phase_d_v4_mask_v1,length,boolean_bytes,epoch_offsets)",
+      "replay_arrays": ["schedule", "actual_trunk_exact", "head_update"],
+      "new_periodic_positions": "floor(j*n/k)_for_j_0_through_k_minus_1",
+      "historical_midpoint_positions": "floor((j+0.5)*n/k)_for_j_0_through_k_minus_1",
+      "fixed_frontloaded_epoch_phase_fractions": [0.4, 0.35, 0.3, 0.3],
+      "fixed_frontloaded_phase_epochs": 3,
+      "fixed_uniform_fraction": 0.3333333333333333,
+      "epoch_exact_count_rounding": "floor(n*fraction+0.5)",
+      "gap_permutation_preserves": ["epoch_length", "exact_count", "first_exact", "last_exact", "internal_gap_multiset", "leading_prefix", "trailing_suffix"],
+      "gap_moved_fraction": "number_of_gap_entries_changing_position_divided_by_number_of_randomizable_gap_entries",
+      "locked_gap_replicates": [0, 1, 2],
+      "replica_aggregation": "average_within_classifier_seed_before_seed_level_comparison",
+      "matching_scope_labels": ["total_exact_budget_only_not_temporal_matching", "per_epoch_exact_budget_not_burst_or_phase_matching", "epoch_budget_and_gap_multiset_not_complete_temporal_matching", "approximately_budget_comparable_not_donor_matched", "fixed_uniform_not_donor_matched"],
+      "mask_derived_controls_are_retrospective": true
+    },
+    "calibration_and_profile": {
+      "calibration_batches": 48,
+      "calibration_source": "training_stream_disposable_warmup_copy",
+      "calibration_loader_epoch": 911,
+      "profile_settling_batches": 2,
+      "profile_timed_batches": 12,
+      "profile_components": ["plain_exact", "exact_plus_predictor", "learned_synthetic", "zero_synthetic_shadow", "skip_synthetic_shadow", "controller_overhead"],
+      "controller_overhead_clock": "cpu_perf_counter"
+    },
+    "reproducibility": {
+      "initialization_seed_formula": "18371+classifier_seed",
+      "epoch_loader_seed_formula": "245600+100000*classifier_seed+global_epoch",
+      "controller_rng_separate_from_augmentation": true,
+      "gap_permutation_seed_formula": "900000+1000*classifier_seed+100*replicate+postwarm_epoch",
+      "diagnostic_probe_seed": 88001,
+      "deterministic_algorithms": "strict",
+      "v3_warn_only_compatibility_is_separate_condition": true
+    },
+    "diagnostics": {
+      "probe_postwarm_epochs": [0, 1, 6, 12],
+      "fixed_training_probe_batches": 4,
+      "fixed_training_probe_batch_size": 32,
+      "normalized_target_floor": 1e-8,
+      "controller_metrics_from_prefit_prediction": true,
+      "production_state_isolation_required": true
+    },
+    "evaluation": {
+      "validation_after_every_epoch": true,
+      "accuracy_units": "fraction_0_1",
+      "primary_endpoint": "final_epoch_validation_accuracy",
+      "targets": [0.85, 0.87, 0.89],
+      "unattained_time": null,
+      "best_accuracy_secondary_selection_biased": true,
+      "final_test_requires_separate_authorization": true,
+      "paired_unit": "classifier_seed",
+      "paired_accuracy_difference_unit": "percentage_points",
+      "paired_time_statistic": "log_reference_over_candidate_ratio",
+      "student_t_critical_95": {"3": 4.302653, "5": 2.776445},
+      "bonferroni_two_contrast_t_critical_97_5": {"5": 3.495406},
+      "unsupported_seed_counts": "fail_without_approximation"
+    },
+    "timing": {
+      "cpu_clock": "perf_counter",
+      "cuda_phase_boundary_synchronization": true,
+      "normal_loop_per_batch_synchronization": false,
+      "ledger_components": ["setup", "scale_estimation", "warmup_training", "warmup_validation", "calibration", "postwarm_training", "postwarm_validation", "diagnostics", "checkpoint_log_io", "finalization"],
+      "report_full_and_postwarm_speedups": true,
+      "counts_are_not_runtime_proxies": true
+    },
+    "m6_orchestration": {
+      "ordering_seed_base": 73001,
+      "donors_before_randomized_measured_block": true,
+      "repeated_block_order": "cyclic_rotation_of_saved_base_order",
+      "hardware_drift_threshold_fraction": 0.1,
+      "hardware_drift_action": "retain_records_and_repeat_entire_block_only_if_authorized",
+      "cost_classes": ["measured_continuous", "attributed_standalone", "replay_conditional", "dependency_inclusive"],
+      "resumed_runs_clean_timing_eligible": false,
+      "retrospective_controls_deployment_pareto_eligible": false
+    },
+    "telemetry": {
+      "epoch_count_fields": ["batches_seen", "samples_seen", "exact_trunk_backwards", "synthetic_backwards", "zero_backwards", "skipped_slots", "trunk_optimizer_steps", "head_optimizer_steps", "predictor_fits", "predictor_inferences"],
+      "controller_error_timestamp": "pre_fit",
+      "synthetic_classifier_loss": null,
+      "accuracy_unit": "fraction_0_1",
+      "accuracy_difference_unit": "percentage_points",
+      "wall_time_unit": "seconds",
+      "latency_unit": "milliseconds",
+      "memory_unit": "MiB"
+    },
+    "persistence": {
+      "resume_boundary": "epoch",
+      "mid_epoch_resume_supported": false,
+      "atomic_local_replace": true,
+      "checkpoint_every_epochs": 1,
+      "weights_only_load_compatible": true,
+      "source_hashes_required": true,
+      "broad_overwrite_supported": false
+    },
+    "outputs": {
+      "run_files": ["manifest.json", "epochs.csv", "controller_events.csv", "masks.npz", "mask_manifest.json", "summary.json", "timing.json", "checkpoints", "errors.jsonl"],
+      "feedback_run_files": ["calibration.json"],
+      "diagnostic_files": ["gradient_diagnostics.csv", "update_probes.csv", "normalization_probes.csv"],
+      "profile_files": ["profile_samples.csv", "profile_summary.json"],
+      "replay_files": ["replay_provenance.json"],
+      "schedule_files": ["schedule_provenance.json"],
+      "unavailable_numeric_representation": "null_with_status",
+      "every_row_has_schema_run_seed_method_and_key": true,
+      "study_files": ["locked_protocol.json", "run_order_manifest.json", "paired_comparisons.csv", "target_attainment.csv", "aggregate_tables", "accuracy_vs_epoch.png", "accuracy_vs_time.png"]
+    }
+  },
+  "execution": {
+    "device": "cuda",
+    "precision": "fp32",
+    "amp": false,
+    "gradient_accumulation_steps": 1,
+    "torch_compile": false,
+    "automatic_batch_size_changes": false,
+    "workers": 0,
+    "pin_memory": false,
+    "matmul_tf32": false,
+    "cudnn_tf32": false,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": true,
+    "checkpoint_policy": "every_epoch"
+  },
+  "output": {
+    "root": "runs_phase_d_v4",
+    "study_id": "unset_until_approved",
+    "run_id": "unset_until_approved"
+  }
+}
