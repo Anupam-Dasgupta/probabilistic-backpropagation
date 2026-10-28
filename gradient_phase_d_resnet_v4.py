@@ -27,6 +27,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
 
 from phase_d_v4_io import (
+    COMPATIBLE_T4_RESUME_POLICY,
     SCHEMA_VERSION,
     METHOD_SPECS,
     MaskMetadata,
@@ -43,20 +44,27 @@ from phase_d_v4_io import (
     RunState,
     StepResult,
     SyntheticBehavior,
+    STRICT_RESUME_POLICY,
+    RESUME_COMPATIBILITY_POLICIES,
     TimingLedger,
     UpdateType,
     atomic_write_json,
     capture_rng_state,
-    copy_checkpoint_verified,
+    commit_resume_snapshot_timing,
     environment_metadata,
     execution_fingerprint,
     fingerprint,
     latest_committed_checkpoint,
     load_checkpoint,
+    load_continuation_evidence,
+    load_resume_attempts,
     load_mask,
     mask_identity_hash,
     load_run_config,
     reconcile_outputs,
+    record_resume_attempt,
+    record_continuation_evidence,
+    resume_compatibility_report,
     restore_rng_state,
     run_state_from_dict,
     run_state_to_dict,
@@ -64,6 +72,8 @@ from phase_d_v4_io import (
     sha256_file,
     validate_output_root,
     validate_config,
+    backup_resume_snapshot,
+    restore_resume_snapshot,
 )
 from phase_d_v4_diagnostics import (
     gradient_metrics,
@@ -1110,9 +1120,30 @@ def configure_determinism(config: RunConfig, device: torch.device | str) -> None
 
     selected = torch.device(device)
     execution = config.values["execution"]
+
+    
     if selected.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable; CPU fallback is disabled")
+        raise RuntimeError(
+            "CUDA was requested but is unavailable; CPU fallback is disabled"
+        )
+
+    if selected.type == "cuda":
+        workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+
+        if workspace is None:
+            if torch.cuda.is_initialized():
+                raise RuntimeError(
+                    "CUDA was initialized before CUBLAS_WORKSPACE_CONFIG "
+                    "was set. Restart the Python process."
+                )
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+        elif workspace not in {":4096:8", ":16:8"}:
+            raise RuntimeError(
+                "Unsupported CUBLAS_WORKSPACE_CONFIG for strict determinism"
+            )
     torch.backends.cudnn.benchmark = bool(execution["cudnn_benchmark"])
+    
     torch.backends.cudnn.deterministic = bool(execution["cudnn_deterministic"])
     torch.backends.cuda.matmul.allow_tf32 = bool(execution["matmul_tf32"])
     torch.backends.cudnn.allow_tf32 = bool(execution["cudnn_tf32"])
@@ -1840,14 +1871,25 @@ def _checkpoint_payload(
     data_identities: Mapping[str, str],
     run_id: str,
     replay_mask_metadata: Mapping[str, Any] | None,
+    *,
+    original_environment: Mapping[str, Any] | None = None,
+    original_execution_hash: str | None = None,
 ) -> dict[str, Any]:
-    """Build a complete graph-free epoch-boundary checkpoint payload in memory."""
+    """Build a complete graph-free epoch-boundary checkpoint payload in memory.
+
+    Inputs contain all scientific state plus current and optional original
+    execution identities. The returned CPU payload preserves the original
+    environment/fingerprint while separately recording the current session and
+    timing-session history. It captures RNG state but does not write files or
+    mutate model, optimizer, controller, or data-loader state.
+    """
 
     identity = config.values["scientific"]["identity"]
     return {
         "schema_version": SCHEMA_VERSION,
         "scientific_fingerprint": scientific_hash,
-        "execution_fingerprint": execution_hash,
+        "execution_fingerprint": original_execution_hash or execution_hash,
+        "current_execution_fingerprint": execution_hash,
         "artifacts": dict(artifacts),
         "data_identities": dict(data_identities),
         "resolved_config": config.to_dict(),
@@ -1890,7 +1932,9 @@ def _checkpoint_payload(
         "run_state": run_state_to_dict(state),
         "rng_state": capture_rng_state(),
         "timing_ledger": ledger.to_dict(),
-        "environment": dict(environment),
+        "environment": dict(original_environment or environment),
+        "current_environment": dict(environment),
+        "execution_sessions": copy.deepcopy(ledger.sessions),
         "run_complete": state.completed,
     }
 
@@ -2187,16 +2231,27 @@ def _initialize_run(
     resolved_artifacts = _resolved_artifacts(artifacts)
     scientific_hash = fingerprint(config, {**resolved_artifacts, **data_identities})
     execution_hash = execution_fingerprint(config, environment)
+    ledger.begin_session(
+        environment,
+        execution_hash,
+        policy=STRICT_RESUME_POLICY,
+        cross_device=False,
+        checkpoint_sequence=0,
+    )
     ledger.add("setup", time.perf_counter() - setup_started)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "run_id": config.values["output"]["run_id"],
         "scientific_fingerprint": scientific_hash,
         "execution_fingerprint": execution_hash,
+        "current_execution_fingerprint": execution_hash,
         "resolved_config": config.to_dict(),
         "artifacts": resolved_artifacts,
         "data_identities": dict(data_identities),
         "environment": environment,
+        "current_environment": environment,
+        "execution_sessions": copy.deepcopy(ledger.sessions),
+        "cross_device_resumed": False,
         "resumed": False,
         "replay_provenance": replay_metadata,
         "verified_checkpoint_persistence": {
@@ -2218,6 +2273,8 @@ def _initialize_run(
         "artifacts": resolved_artifacts,
         "scientific_fingerprint": scientific_hash,
         "execution_fingerprint": execution_hash,
+        "original_environment": environment,
+        "original_execution_fingerprint": execution_hash,
         "replay_mask_metadata": replay_metadata,
         "calibration": None if calibration is None else dict(calibration),
         "persistence_directory": persistence_directory,
@@ -2232,7 +2289,15 @@ def _commit_epoch(
     validation_result: Mapping[str, Any],
     validation_seconds: float,
 ) -> Path:
-    """Commit one validated epoch checkpoint and reconcile all derived outputs."""
+    """Commit one epoch and include verified persistence in its I/O ledger.
+
+    Inputs are the live runner context, resolved config, local run directory,
+    detached epoch/validation records, and validation seconds. The returned path
+    is the immutable local checkpoint. This mutates run counters and timing,
+    atomically reconciles local outputs, optionally creates a checksum-verified
+    recovery snapshot, and publishes its post-commit timing record. Any local or
+    persistence failure raises; an incomplete remote snapshot is never restorable.
+    """
 
     state: RunState = context["state"]
     ledger: TimingLedger = context["ledger"]
@@ -2288,6 +2353,8 @@ def _commit_epoch(
         context["data_identities"],
         config.values["output"]["run_id"],
         context.get("replay_mask_metadata"),
+        original_environment=context.get("original_environment"),
+        original_execution_hash=context.get("original_execution_fingerprint"),
     )
     checkpoint_path = run_directory / "checkpoints" / f"checkpoint_{state.checkpoint_sequence:06d}.pt"
     journal_path = run_directory / "checkpoint_journal.json"
@@ -2308,6 +2375,8 @@ def _commit_epoch(
         context["data_identities"],
         config.values["output"]["run_id"],
         context.get("replay_mask_metadata"),
+        original_environment=context.get("original_environment"),
+        original_execution_hash=context.get("original_execution_fingerprint"),
     )
     output_payload["resume_metadata"] = {
         "checkpoint_sha256": commit["sha256"],
@@ -2315,14 +2384,7 @@ def _commit_epoch(
     }
     reconcile_outputs(run_directory, output_payload)
     persistence_copy = None
-    if context.get("persistence_directory") is not None:
-        # Copy only the immutable committed checkpoint. The helper verifies its
-        # bytes and publishes the destination marker last, so partial copies are
-        # never eligible for recovery.
-        persistence_copy = copy_checkpoint_verified(
-            checkpoint_path,
-            Path(context["persistence_directory"]) / "checkpoints",
-        )
+    snapshot_ready = None
     if state.completed and context["predictor"] is not None:
         predictor_path = run_directory / "final_predictor.pt"
         predictor_temporary = run_directory / "final_predictor.pt.tmp"
@@ -2331,6 +2393,20 @@ def _commit_epoch(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(predictor_temporary, predictor_path)
+    if context.get("persistence_directory") is not None:
+        # The epoch snapshot is part of required workflow I/O. Its ready marker
+        # is published before the timer stops; a separate committed timing record
+        # lets recovery add this duration exactly once to the pre-I/O checkpoint.
+        snapshot_ready = backup_resume_snapshot(
+            run_directory,
+            context["persistence_directory"],
+            checkpoint_path,
+        )
+        persistence_copy = (
+            Path(context["persistence_directory"])
+            / "checkpoints"
+            / checkpoint_path.name
+        )
     total_io_seconds = time.perf_counter() - io_started
     ledger.add("checkpoint_log_io", total_io_seconds)
     ledger.checkpoint_io.append(
@@ -2347,6 +2423,14 @@ def _commit_epoch(
             journal_record["io_seconds"] = total_io_seconds
     atomic_write_json(journal_path, journal)
     atomic_write_json(run_directory / "timing.json", ledger.to_dict())
+    manifest_path = run_directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["execution_sessions"] = copy.deepcopy(ledger.sessions)
+    manifest["current_environment"] = copy.deepcopy(context["environment"])
+    manifest["current_execution_fingerprint"] = context["execution_fingerprint"]
+    atomic_write_json(manifest_path, manifest)
+    if snapshot_ready is not None:
+        commit_resume_snapshot_timing(snapshot_ready, total_io_seconds)
     return checkpoint_path
 
 
@@ -2475,17 +2559,20 @@ def resume_run(
     checkpoint_path: str | Path | None = None,
     stop_after_global_epoch: int | None = None,
     persistence_directory: str | Path | None = None,
+    resume_compatibility_policy: str = STRICT_RESUME_POLICY,
 ) -> dict[str, Any]:
     """Restore a committed epoch boundary and continue without duplicating rows.
 
     Inputs identify the same datasets, identities, optional replay artifacts,
     checkpoint/stop boundary, and optional verified-copy directory as the fresh
     run. The returned context contains restored and continued production state.
-    Scientific/execution/source/data/mask identities must match before modules or
-    optimizers are mutated; timing gaps are flagged, outputs are reconciled, and
-    an uncommitted interrupted epoch is intentionally repeated in full.
+    Scientific/source/data/mask identities must match before modules or optimizers
+    are mutated. Execution identity is strict by default; the explicit versioned
+    compatible-T4 policy may admit only its enumerated provenance changes. Timing
+    gaps are flagged, outputs are reconciled, and an uncommitted epoch is repeated.
     """
 
+    resume_started = time.perf_counter()
     validate_config(config)
     _validate_data_identities(data_identities)
     replay_inputs = _prepare_schedule_inputs(config, train_dataset, mask_path, mask_manifest_path)
@@ -2508,7 +2595,6 @@ def resume_run(
         )
     expected = {
         "scientific_fingerprint": scientific_hash,
-        "execution_fingerprint": execution_hash,
         "run_id": config.values["output"]["run_id"],
         "seed": int(config.values["scientific"]["identity"]["classifier_seed"]),
         "method": config.values["scientific"]["identity"]["method"],
@@ -2523,6 +2609,76 @@ def resume_run(
         expected=expected,
         journal_path=run_path / "checkpoint_journal.json",
     )
+    saved_config = RunConfig(copy.deepcopy(payload["resolved_config"]))
+    saved_environment = payload.get("current_environment", payload.get("environment"))
+    if not isinstance(saved_environment, Mapping):
+        raise ValueError("checkpoint lacks saved execution environment")
+    compatibility = resume_compatibility_report(
+        saved_config,
+        saved_environment,
+        config,
+        environment,
+        resume_compatibility_policy,
+    )
+    recorded_current_hash = payload.get(
+        "current_execution_fingerprint", payload.get("execution_fingerprint")
+    )
+    if compatibility["saved_execution_fingerprint"] != recorded_current_hash:
+        raise ValueError("checkpoint execution fingerprint does not match saved environment")
+    current_sequence = int(payload["checkpoint_sequence"])
+    prior_attempts = load_resume_attempts(run_path, persistence_directory)
+    repeated_attempts = [
+        int(item["attempt_id"])
+        for item in prior_attempts
+        if int(item.get("started_from_checkpoint_sequence", -1)) == current_sequence
+    ]
+    resume_attempt = record_resume_attempt(
+        run_path,
+        persistence_directory,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "policy_version": compatibility["policy_version"],
+            "policy": resume_compatibility_policy,
+            "started_from_checkpoint_sequence": current_sequence,
+            "restart_from_global_epoch": int(payload["next_epoch"]),
+            "repeated_prior_attempt_ids": repeated_attempts,
+            "saved_execution_fingerprint": compatibility["saved_execution_fingerprint"],
+            "current_execution_fingerprint": execution_hash,
+            "current_environment": environment,
+            "cross_device": bool(compatibility["cross_device"]),
+            "interruption_gap_seconds": None,
+            "recovery_preparation_seconds_before_attempt_commit": (
+                time.perf_counter() - resume_started
+            ),
+        },
+    )
+    prior_continuation_evidence = load_continuation_evidence(
+        run_path, persistence_directory
+    )
+    current_continuation_evidence = None
+    if compatibility["cross_device"]:
+        # The authoritative runner performs the bounded copied-state check before
+        # constructing or mutating production modules. A failed probe or evidence
+        # write leaves only the immutable resume-attempt record and stops here.
+        probe_result = probe_checkpoint_continuation(config, checkpoint, selected)
+        if probe_result["checkpoint_sha256"] != payload["resume_metadata"]["checkpoint_sha256"]:
+            raise ValueError("continuation probe checkpoint identity differs from resume commit")
+        if probe_result.get("device_type") != environment.get("device_type"):
+            raise ValueError("continuation probe device differs from current execution environment")
+        current_continuation_evidence = record_continuation_evidence(
+            run_path,
+            persistence_directory,
+            {
+                **probe_result,
+                "schema_version": SCHEMA_VERSION,
+                "policy_version": compatibility["policy_version"],
+                "policy": resume_compatibility_policy,
+                "resume_attempt_id": int(resume_attempt["attempt_id"]),
+                "checkpoint_sequence": current_sequence,
+                "current_execution_fingerprint": execution_hash,
+                "current_environment": environment,
+            },
+        )
     method = MethodId(config.values["scientific"]["identity"]["method"])
     include_predictor = _method_uses_predictor(config)
     model, predictor = build_models(config, selected, include_predictor=include_predictor)
@@ -2550,6 +2706,43 @@ def resume_run(
     ):
         raise ValueError("post-warm feedback checkpoint lacks controller state")
     state = run_state_from_dict(payload["run_state"])
+
+    # The checkpoint cannot contain its own SHA-256 because that hash
+    # is only known after serialization. Restore it from the verified
+    # checkpoint commit metadata before continuing training.
+    current_hash = payload["resume_metadata"]["checkpoint_sha256"]
+
+    matching_records = [
+        row for row in state.epoch_records
+        if int(row["checkpoint_sequence"]) == current_sequence
+    ]
+    if len(matching_records) != 1:
+        raise ValueError(
+            "Expected exactly one epoch record for resumed checkpoint"
+        )
+
+    recorded_hash = matching_records[0].get("checkpoint_sha256", "")
+    if recorded_hash not in ("", current_hash):
+        raise ValueError(
+            "Epoch record checkpoint hash conflicts with verified checkpoint"
+        )
+
+    matching_records[0]["checkpoint_sha256"] = current_hash
+
+    # An older missing hash must never be silently accepted.
+    for row in state.epoch_records:
+        digest = row.get("checkpoint_sha256", "")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError(
+                "Earlier epoch has missing checkpoint identity"
+            )
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise ValueError(
+                "Earlier epoch has invalid checkpoint identity"
+            ) from exc
+
     if state.pending_quota != int(payload["pending_quota"]):
         raise ValueError("pending quota mismatch inside checkpoint")
     if _mask_prefix_hash(state.executed_exact_mask) != payload["executed_mask_sha256"]:
@@ -2569,6 +2762,23 @@ def resume_run(
         if state.mask_cursor != state.postwarm_step or state.mask_cursor > len(replay_mask):
             raise ValueError("checkpoint replay cursor is inconsistent")
     ledger = TimingLedger.from_dict(payload["timing_ledger"])
+    if not ledger.sessions:
+        # Legacy same-environment checkpoints predate session buckets. Preserve
+        # their cumulative timing as one explicitly reconstructed origin session;
+        # they remain ineligible for compatible-T4 recovery because the required
+        # capability fields are absent from old environment records.
+        ledger.sessions.append(
+            {
+                "session_index": 0,
+                "environment": copy.deepcopy(payload["environment"]),
+                "execution_fingerprint": str(payload["execution_fingerprint"]),
+                "resume_policy": "legacy_strict_reconstructed",
+                "cross_device": False,
+                "started_from_checkpoint_sequence": 0,
+                "interruption_gap_seconds": None,
+                "components": copy.deepcopy(ledger.components),
+            }
+        )
     timing_record = payload["resume_metadata"].get("checkpoint_io_record")
     if timing_record is None:
         ledger.incomplete.append(f"missing checkpoint I/O timing for sequence {state.checkpoint_sequence}")
@@ -2579,11 +2789,74 @@ def resume_run(
         ledger.add("checkpoint_log_io", float(timing_record["io_seconds"]))
         ledger.checkpoint_io.append(dict(timing_record))
     restore_rng_state(payload["rng_state"])
+    ledger.begin_session(
+        environment,
+        execution_hash,
+        policy=resume_compatibility_policy,
+        cross_device=bool(compatibility["cross_device"]),
+        checkpoint_sequence=state.checkpoint_sequence,
+        resume_attempt_id=int(resume_attempt["attempt_id"]),
+    )
+    recorded_attempt_ids = {
+        int(item["resume_attempt_id"])
+        for item in state.interruptions
+        if item.get("resume_attempt_id") is not None
+    }
+    for prior in prior_attempts:
+        attempt_id = int(prior["attempt_id"])
+        if attempt_id in recorded_attempt_ids:
+            continue
+        start_sequence = int(prior["started_from_checkpoint_sequence"])
+        state.interruptions.append(
+            {
+                "resume_checkpoint_sequence": start_sequence,
+                "restart_from_global_epoch": int(prior["restart_from_global_epoch"]),
+                "mid_epoch_resume": False,
+                "repeated_incomplete_epoch": (
+                    int(prior["restart_from_global_epoch"])
+                    if current_sequence == start_sequence else None
+                ),
+                "resume_policy_version": prior["policy_version"],
+                "resume_policy": prior["policy"],
+                "saved_execution_fingerprint": prior["saved_execution_fingerprint"],
+                "current_execution_fingerprint": prior["current_execution_fingerprint"],
+                "cross_device": bool(prior["cross_device"]),
+                "interruption_gap_seconds": None,
+                "resume_attempt_id": attempt_id,
+                "repeated_prior_attempt_ids": list(prior.get("repeated_prior_attempt_ids", [])),
+                "attempt_completed_epoch_commit": current_sequence > start_sequence,
+                "recovery_preparation_seconds_before_attempt_commit": float(
+                    prior.get("recovery_preparation_seconds_before_attempt_commit", 0.0)
+                ),
+                "continuation_evidence": next(
+                    (
+                        item for item in prior_continuation_evidence
+                        if int(item["resume_attempt_id"]) == attempt_id
+                    ),
+                    None,
+                ),
+            }
+        )
     state.interruptions.append(
         {
             "resume_checkpoint_sequence": state.checkpoint_sequence,
             "restart_from_global_epoch": state.next_epoch,
             "mid_epoch_resume": False,
+            "repeated_incomplete_epoch": (
+                state.next_epoch if resume_attempt["repeated_prior_attempt_ids"] else None
+            ),
+            "resume_policy_version": compatibility["policy_version"],
+            "resume_policy": resume_compatibility_policy,
+            "saved_execution_fingerprint": compatibility["saved_execution_fingerprint"],
+            "current_execution_fingerprint": execution_hash,
+            "cross_device": bool(compatibility["cross_device"]),
+            "interruption_gap_seconds": None,
+            "resume_attempt_id": int(resume_attempt["attempt_id"]),
+            "repeated_prior_attempt_ids": list(resume_attempt["repeated_prior_attempt_ids"]),
+            "recovery_preparation_seconds_before_attempt_commit": float(
+                resume_attempt["recovery_preparation_seconds_before_attempt_commit"]
+            ),
+            "continuation_evidence": current_continuation_evidence,
         }
     )
     context = {
@@ -2598,6 +2871,8 @@ def resume_run(
         "data_identities": dict(data_identities),
         "scientific_fingerprint": scientific_hash,
         "execution_fingerprint": execution_hash,
+        "original_environment": copy.deepcopy(payload["environment"]),
+        "original_execution_fingerprint": str(payload["execution_fingerprint"]),
         "replay_mask_metadata": replay_metadata,
         "calibration": None if calibration is None else dict(calibration),
         "persistence_directory": (
@@ -2606,6 +2881,18 @@ def resume_run(
     }
     manifest = json.loads((run_path / "manifest.json").read_text(encoding="utf-8"))
     manifest["resumed"] = True
+    manifest["cross_device_resumed"] = bool(
+        manifest.get("cross_device_resumed") or compatibility["cross_device"]
+    )
+    manifest["current_environment"] = copy.deepcopy(environment)
+    manifest["current_execution_fingerprint"] = execution_hash
+    manifest["execution_sessions"] = copy.deepcopy(ledger.sessions)
+    manifest["resume_compatibility"] = compatibility
+    manifest["resume_attempts"] = [*prior_attempts, resume_attempt]
+    manifest["continuation_evidence"] = [
+        *prior_continuation_evidence,
+        *([] if current_continuation_evidence is None else [current_continuation_evidence]),
+    ]
     manifest["resume_checkpoint_sequence"] = state.checkpoint_sequence
     if persistence_directory is not None:
         manifest["verified_checkpoint_persistence"] = {
@@ -2615,6 +2902,7 @@ def resume_run(
         }
     atomic_write_json(run_path / "manifest.json", manifest)
     reconcile_outputs(run_path, payload)
+    ledger.add("recovery_overhead", time.perf_counter() - resume_started)
     return _continue_run(
         context,
         config,
@@ -2645,6 +2933,127 @@ def _state_trees_equal(left: Any, right: Any) -> bool:
             _state_trees_equal(a, b) for a, b in zip(left, right, strict=True)
         )
     return left == right
+
+
+def _assert_state_trees_close(left: Any, right: Any, *, rtol: float, atol: float) -> None:
+    """Require matching nested state with declared floating-point tolerances.
+
+    Inputs are two tensor/scalar container trees and relative/absolute tolerances.
+    Nothing is returned. Tensor leaves use ``torch.testing.assert_close`` while
+    discrete structure and values remain exact; a mismatch raises without
+    mutating either tree, RNG, modules, files, or devices.
+    """
+
+    if isinstance(left, Tensor):
+        if not isinstance(right, Tensor):
+            raise AssertionError("state leaf type differs")
+        torch.testing.assert_close(left, right, rtol=rtol, atol=atol)
+        return
+    if isinstance(left, Mapping):
+        if not isinstance(right, Mapping) or left.keys() != right.keys():
+            raise AssertionError("state mapping structure differs")
+        for key in left:
+            _assert_state_trees_close(left[key], right[key], rtol=rtol, atol=atol)
+        return
+    if isinstance(left, (list, tuple)):
+        if not isinstance(right, type(left)) or len(left) != len(right):
+            raise AssertionError("state sequence structure differs")
+        for left_item, right_item in zip(left, right, strict=True):
+            _assert_state_trees_close(left_item, right_item, rtol=rtol, atol=atol)
+        return
+    if left != right:
+        raise AssertionError("discrete state value differs")
+
+
+def probe_checkpoint_continuation(
+    config: RunConfig,
+    checkpoint_path: str | Path,
+    device: torch.device | str,
+) -> dict[str, Any]:
+    """Check deterministic copied-state continuation without touching production.
+
+    Inputs identify a resolved config, committed checkpoint, and already approved
+    device. Two independent cloned model/predictor/optimizer states perform one
+    exact update on a private fixed synthetic batch. The returned report records
+    the checkpoint hash, device-specific M1 tolerance, and successful state
+    agreement. The checkpoint bytes, production modules, controller, loader, and
+    RNG streams are unchanged; process RNG is captured and restored even on
+    failure. This bounded check detects corrupt/incompletely restorable optimizer
+    continuation on the replacement allocation, but it is not evidence that two
+    physical T4s produce identical scientific trajectories or timings.
+    """
+
+    selected = torch.device(device)
+    before_hash = sha256_file(checkpoint_path)
+    rng_before = capture_rng_state()
+    try:
+        payload = load_checkpoint(checkpoint_path)
+        scale = payload.get("scale")
+        if scale is None or float(scale) <= 0:
+            raise ValueError("continuation probe requires a checkpoint with positive scale")
+        include_predictor = payload.get("predictor") is not None
+        states: list[dict[str, Any]] = []
+        probe_rng = capture_rng_state()
+        for _replica in range(2):
+            # Predictor dropout and model construction must begin from the same
+            # copied RNG state in both branches; the outer finally restores the
+            # caller's streams after the bounded check.
+            restore_rng_state(probe_rng)
+            model, predictor = build_models(config, selected, include_predictor=include_predictor)
+            model.load_state_dict(payload["model"])
+            if predictor is not None:
+                predictor.load_state_dict(payload["predictor"])
+            optimizers = build_optimizers(model, predictor, config)
+            for name, optimizer in optimizers.items():
+                saved = payload["optimizers"][name]
+                if optimizer is None or saved is None:
+                    if optimizer is not None or saved is not None:
+                        raise ValueError("continuation probe optimizer presence differs")
+                    continue
+                # Optimizer loaders may retain references to state tensors; copy
+                # so the first probe branch cannot alter the source payload used
+                # to initialize the second branch.
+                optimizer.load_state_dict(copy.deepcopy(saved))
+                _restore_optimizer_devices(optimizer)
+            stage = "postwarm" if int(payload["next_epoch"]) >= int(
+                config.values["scientific"]["training"]["warmup_epochs"]
+            ) else "warmup"
+            set_training_mode(
+                model, predictor, stage,
+                config.values["scientific"]["identity"]["normalization"],
+            )
+            private = torch.Generator(device="cpu").manual_seed(48151623)
+            inputs = torch.randn(2, 3, 32, 32, generator=private).to(selected)
+            labels = torch.tensor([1, 7], dtype=torch.long, device=selected)
+            exact_step(
+                model, predictor, optimizers, inputs, labels, float(scale), config,
+                fit_predictor=predictor is not None, head_update=True,
+            )
+            states.append(
+                {
+                    "model": _cpu_tree(model.state_dict()),
+                    "predictor": None if predictor is None else _cpu_tree(predictor.state_dict()),
+                    "optimizers": {
+                        name: None if optimizer is None else _cpu_tree(optimizer.state_dict())
+                        for name, optimizer in optimizers.items()
+                    },
+                }
+            )
+        rtol, atol = ((1e-4, 3e-5) if selected.type == "cuda" else (1e-5, 1e-6))
+        _assert_state_trees_close(states[0], states[1], rtol=rtol, atol=atol)
+    finally:
+        restore_rng_state(rng_before)
+    if sha256_file(checkpoint_path) != before_hash:
+        raise RuntimeError("continuation probe changed checkpoint bytes")
+    return {
+        "status": "copied_state_deterministic_continuation_passed",
+        "checkpoint_sha256": before_hash,
+        "device_type": selected.type,
+        "rtol": rtol,
+        "atol": atol,
+        "production_state_mutated": False,
+        "cross_device_numerical_equivalence_proven": False,
+    }
 
 
 def check_replay_equality(
@@ -2938,6 +3347,7 @@ def _run_scientific_command(args: argparse.Namespace, *, resume: bool) -> None:
             config, train, validation, args.out, args.device,
             checkpoint_path=args.checkpoint,
             stop_after_global_epoch=args.stop_after_global_epoch,
+            resume_compatibility_policy=args.resume_compatibility,
             **keyword,
         )
     else:
@@ -3087,6 +3497,7 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     smoke.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     smoke.add_argument("--out", required=True)
     smoke.add_argument("--stop-after-global-epoch", type=int)
+    smoke.add_argument("--persistence-dir")
     resume = subparsers.add_parser(
         "resume", help="resume a synthetic workflow or one explicit scientific run"
     )
@@ -3100,6 +3511,12 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     resume.add_argument("--mask-manifest")
     resume.add_argument("--stop-after-global-epoch", type=int)
     resume.add_argument("--persistence-dir")
+    resume.add_argument(
+        "--resume-compatibility",
+        choices=RESUME_COMPATIBILITY_POLICIES,
+        default=STRICT_RESUME_POLICY,
+        help="strict by default; compatible_nvidia_t4 is only for controlled T4 replacement",
+    )
     resume.add_argument("--authorize-real-data", action="store_true")
     resume.add_argument("--authorize-full-pilot", action="store_true")
     profile = subparsers.add_parser("profile", help="run the bounded synthetic M3 step profile")
@@ -3215,7 +3632,6 @@ def main(arguments: list[str] | None = None) -> int:
         value is not None
         for value in (
             args.data_dir, args.split_file, args.mask, args.mask_manifest,
-            args.persistence_dir,
         )
     ):
         raise ValueError("synthetic resume must not receive scientific data or mask arguments")
@@ -3232,6 +3648,7 @@ def main(arguments: list[str] | None = None) -> int:
             artifacts=artifacts,
             data_identities=identities,
             stop_after_global_epoch=args.stop_after_global_epoch,
+            persistence_directory=args.persistence_dir,
         )
     elif args.command == "resume":
         resume_run(
@@ -3243,6 +3660,8 @@ def main(arguments: list[str] | None = None) -> int:
             artifacts=artifacts,
             data_identities=identities,
             checkpoint_path=args.checkpoint,
+            persistence_directory=args.persistence_dir,
+            resume_compatibility_policy=args.resume_compatibility,
         )
     print(f"Synthetic {args.command} completed: {output}")
     return 0

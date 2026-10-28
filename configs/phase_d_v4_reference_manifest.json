@@ -10,7 +10,7 @@
   },
   "governing_artifacts": {
     "AGENTS.md": {"sha256": "6d343b0a158e74fc812ba11c2b349952bc6c7baa31c937c2dc6cb17c345e580d", "size_bytes": 4955},
-    "IMPLEMENTATION_PLAN.md": {"sha256": "6824bab7855318d097672d67da6301a7a0bbb9eace90b37659b32d0fb95030d0", "size_bytes": 80400},
+    "IMPLEMENTATION_PLAN.md": {"sha256": "589537275f1f4988be1c7517b795cad393daa76dad2793ff0523fdb1bc877cf8", "size_bytes": 82099},
     "RESEARCH_SPEC.md": {"sha256": "bf0f6a77305f0afc7e3e259590b17831bb09fccfd34c6ad535807e1094aa34b4", "size_bytes": 52819},
     "gradient_phase_d_resnet_v3.py": {"sha256": "aa035009b5a77975f8ec6ab8d1b36f912db87e848418ed656a28e84a7cdef914", "size_bytes": 36985}
   },
@@ -20,6 +20,12 @@
     "tree_sha256": "0362d098a43a0d2376358229b3a90d33db5f8d3ec01ef71b615df0fec0a606ab",
     "file_count": 44,
     "total_size_bytes": 1080510472
+  },
+  "reference_results_archive": {
+    "path": "cifar_d_resnet_v3.zip",
+    "sha256": "469dbc42283afe1ace2c8fe29dbdebcee3b22ff6092358ec503b2cdb2920e127",
+    "size_bytes": 998800703,
+    "required_top_level": "cifar_d_resnet_v3/"
   },
   "split_identity": {
     "kind": "declared_contract_hash",

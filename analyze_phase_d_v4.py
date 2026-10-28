@@ -202,8 +202,12 @@ def hardware_identity(environment: Mapping[str, Any], execution: Mapping[str, An
     """
 
     environment_keys = (
-        "python", "torch", "torchvision", "numpy", "cuda_runtime", "cudnn",
-        "device_type", "device_name", "device_uuid", "total_memory_bytes",
+        "python", "system", "machine", "torch", "torchvision", "numpy",
+        "cuda_runtime", "cudnn", "driver_version", "device_type",
+        "device_name", "device_uuid", "device_capability", "total_memory_bytes",
+        "cuda_device_count", "cublas_workspace_config", "matmul_tf32",
+        "cudnn_tf32", "cudnn_benchmark", "cudnn_deterministic",
+        "deterministic_algorithms",
     )
     execution_keys = (
         "precision", "amp", "workers", "pin_memory", "matmul_tf32",
@@ -278,6 +282,47 @@ def validate_run_directory(
     if not isinstance(environment, Mapping):
         raise ValueError("manifest lacks environment identity")
     errors = (root / "errors.jsonl").read_text(encoding="utf-8").strip()
+    resumed = bool(manifest.get("resumed"))
+    cross_device_resumed = bool(manifest.get("cross_device_resumed"))
+    sessions = list(manifest.get("execution_sessions", []))
+    evidence = list(manifest.get("continuation_evidence", []))
+    evidence_by_attempt = {
+        int(item.get("resume_attempt_id", -1)): item
+        for item in evidence if isinstance(item, Mapping)
+    }
+    cross_sessions = [item for item in sessions if bool(item.get("cross_device"))]
+    continuation_evidence_valid = True
+    evidence_attempt_ids = [
+        int(item.get("resume_attempt_id", -1))
+        for item in evidence if isinstance(item, Mapping)
+    ]
+    if len(evidence_attempt_ids) != len(set(evidence_attempt_ids)):
+        continuation_evidence_valid = False
+    if cross_device_resumed and not cross_sessions:
+        continuation_evidence_valid = False
+    for session in cross_sessions:
+        attempt_id = int(session.get("resume_attempt_id", -1))
+        item = evidence_by_attempt.get(attempt_id)
+        if (
+            item is None
+            or item.get("status") != "copied_state_deterministic_continuation_passed"
+            or item.get("production_state_mutated") is not False
+            or item.get("cross_device_numerical_equivalence_proven") is not False
+            or item.get("current_execution_fingerprint") != session.get("execution_fingerprint")
+            or item.get("device_type") != session.get("environment", {}).get("device_type")
+            or int(item.get("checkpoint_sequence", -1))
+            != int(session.get("started_from_checkpoint_sequence", -2))
+            or canonical_json(item.get("current_environment"))
+            != canonical_json(session.get("environment"))
+            or not isinstance(item.get("checkpoint_sha256"), str)
+            or len(item["checkpoint_sha256"]) != 64
+        ):
+            continuation_evidence_valid = False
+            break
+    accuracy_eligible = completed and not bool(errors) and continuation_evidence_valid
+    clean_timing_eligible = (
+        accuracy_eligible and reconciled["complete"] and not resumed and not cross_device_resumed
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "path": str(root.resolve()),
@@ -288,7 +333,11 @@ def validate_run_directory(
         "scientific_fingerprint": manifest.get("scientific_fingerprint"),
         "execution_fingerprint": manifest.get("execution_fingerprint"),
         "completed": completed,
-        "resumed": bool(manifest.get("resumed")),
+        "resumed": resumed,
+        "cross_device_resumed": cross_device_resumed,
+        "execution_sessions": sessions,
+        "continuation_evidence": evidence,
+        "continuation_evidence_valid": continuation_evidence_valid,
         "retrospective": bool(identity.get("retrospective")),
         "deployment_eligible": bool(identity.get("deployment_eligible")),
         "mask_replicate": identity.get("mask_replicate"),
@@ -298,7 +347,11 @@ def validate_run_directory(
         "environment": dict(environment),
         "hardware_key": hardware_identity(environment, config.get("execution", {})),
         "error_log_empty": not bool(errors),
-        "comparison_eligible": completed and reconciled["complete"] and not bool(errors),
+        "accuracy_comparison_eligible": accuracy_eligible,
+        "clean_timing_comparison_eligible": clean_timing_eligible,
+        # Kept for existing accuracy-pair callers; timing paths additionally
+        # require the explicit clean-timing field below.
+        "comparison_eligible": accuracy_eligible,
     }
 
 
@@ -341,9 +394,11 @@ def average_replica_records_within_seed(
 ) -> list[dict[str, Any]]:
     """Average repeated random masks within a classifier seed before inference.
 
-    Inputs are validated run records. Unique method/seed rows pass through. A
-    repeated group is accepted only for gap-permutation records with distinct,
-    explicit replica IDs, common hardware/horizon, and comparison eligibility.
+    Inputs are validated run records. Unique method/seed rows pass through before
+    any replica field is parsed, so ordinary methods may correctly retain a null
+    replica identity. A repeated group is accepted only for gap-permutation
+    records with distinct nonnegative integer replica IDs, common horizon, and
+    valid accuracy eligibility.
     Final accuracy, epoch accuracies/times, and reconciled timing totals are
     averaged arithmetically into one seed-level row. Replicas never increase the
     classifier-seed sample count; source records remain unchanged.
@@ -354,19 +409,28 @@ def average_replica_records_within_seed(
         key = (_as_int(record.get("seed"), "replica seed"), str(record.get("method")))
         groups.setdefault(key, []).append(record)
     output: list[dict[str, Any]] = []
-    for (_seed, method), group in groups.items():
-        if len(group) == 1:
-            output.append(dict(group[0]))
+    for (_seed, method), unsorted_group in sorted(groups.items()):
+        if len(unsorted_group) == 1:
+            output.append(dict(unsorted_group[0]))
             continue
         if method != "relative_gap_permutation_epoch":
             raise ValueError("duplicate non-random method within classifier seed")
-        replicas = [record.get("mask_replicate") for record in group]
-        if any(replica is None for replica in replicas) or len(replicas) != len(set(replicas)):
-            raise ValueError("random-mask replicas must have distinct explicit identities")
+        replicas = [record.get("mask_replicate") for record in unsorted_group]
+        if any(
+            not isinstance(replica, int) or isinstance(replica, bool) or replica < 0
+            for replica in replicas
+        ):
+            raise ValueError(
+                "random-mask replicas must have explicit nonnegative integer identities"
+            )
+        if len(replicas) != len(set(replicas)):
+            raise ValueError("random-mask replica identities must be distinct within seed")
+        group = sorted(
+            unsorted_group,
+            key=lambda record: (record["mask_replicate"], str(record.get("run_id"))),
+        )
         if any(record.get("comparison_eligible") is not True for record in group):
             raise ValueError("incomplete random-mask replica cannot enter seed average")
-        if len({record.get("hardware_key") for record in group}) != 1:
-            raise ValueError("random-mask replicas have mismatched hardware identity")
         horizon = len(group[0].get("epochs", []))
         if any(len(record.get("epochs", [])) != horizon for record in group):
             raise ValueError("random-mask replicas have mismatched horizons")
@@ -376,11 +440,65 @@ def average_replica_records_within_seed(
         averaged["replica_scientific_fingerprints"] = sorted(
             str(record.get("scientific_fingerprint")) for record in group
         )
+        averaged["replica_execution_fingerprints"] = sorted(
+            str(record.get("execution_fingerprint")) for record in group
+        )
+        averaged["replica_hardware_keys"] = sorted(
+            str(record.get("hardware_key")) for record in group
+        )
+        averaged["replica_environments"] = [
+            {
+                "run_id": str(record.get("run_id")),
+                "environment": dict(record.get("environment", {})),
+                "execution_sessions": list(record.get("execution_sessions", [])),
+            }
+            for record in sorted(group, key=lambda record: str(record.get("run_id")))
+        ]
+        averaged["replica_recovery_labels"] = [
+            {
+                "run_id": str(record.get("run_id")),
+                "resumed": bool(record.get("resumed")),
+                "cross_device_resumed": bool(record.get("cross_device_resumed")),
+                "continuation_evidence_valid": bool(
+                    record.get("continuation_evidence_valid", True)
+                ),
+                "clean_timing_comparison_eligible": bool(
+                    record.get("clean_timing_comparison_eligible", False)
+                ),
+            }
+            for record in sorted(group, key=lambda record: str(record.get("run_id")))
+        ]
         averaged["scientific_fingerprint"] = None
         averaged["mask_replicate"] = None
         averaged["replica_count"] = len(group)
         averaged["replica_ids"] = sorted(int(replica) for replica in replicas)
         averaged["replicas_are_independent_seeds"] = False
+        averaged["resumed"] = any(bool(record.get("resumed")) for record in group)
+        averaged["cross_device_resumed"] = any(
+            bool(record.get("cross_device_resumed")) for record in group
+        )
+        averaged["continuation_evidence_valid"] = all(
+            bool(record.get("continuation_evidence_valid", True)) for record in group
+        )
+        averaged["accuracy_comparison_eligible"] = all(
+            record.get("accuracy_comparison_eligible", record.get("comparison_eligible")) is True
+            for record in group
+        )
+        averaged["comparison_eligible"] = averaged["accuracy_comparison_eligible"]
+        clean_flags = [
+            record.get(
+                "clean_timing_comparison_eligible",
+                bool(record.get("comparison_eligible")) and not bool(record.get("resumed")),
+            ) is True
+            for record in group
+        ]
+        averaged["clean_timing_comparison_eligible"] = (
+            all(clean_flags)
+            and not averaged["resumed"]
+            and not averaged["cross_device_resumed"]
+        )
+        hardware_keys = {record.get("hardware_key") for record in group}
+        averaged["hardware_key"] = next(iter(hardware_keys)) if len(hardware_keys) == 1 else None
         averaged["final_accuracy"] = sum(float(record["final_accuracy"]) for record in group) / len(group)
         averaged["epochs"] = []
         for epoch_index in range(horizon):
@@ -497,7 +615,13 @@ def paired_time_ratio(
     logs: list[float] = []
     rows: list[dict[str, Any]] = []
     for seed, reference, candidate in pairs:
-        if reference.get("resumed") or candidate.get("resumed"):
+        if (
+            reference.get("resumed") or candidate.get("resumed")
+            or reference.get("cross_device_resumed")
+            or candidate.get("cross_device_resumed")
+            or reference.get("clean_timing_comparison_eligible") is False
+            or candidate.get("clean_timing_comparison_eligible") is False
+        ):
             raise ValueError("resumed runs cannot support clean efficiency comparisons")
         if reference.get("hardware_key") != candidate.get("hardware_key"):
             raise ValueError("timed pair has mismatched hardware/software identity")
@@ -686,7 +810,10 @@ def deployment_pareto(
     for record in records:
         if not record.get("deployment_eligible") or record.get("retrospective"):
             continue
-        if not record.get("comparison_eligible") or record.get("resumed"):
+        clean_timing = record.get("clean_timing_comparison_eligible")
+        if clean_timing is None:
+            clean_timing = bool(record.get("comparison_eligible")) and not bool(record.get("resumed"))
+        if not clean_timing:
             continue
         candidates.append(
             {
@@ -924,12 +1051,39 @@ def verify_resume_equivalence(
     right = load_checkpoint(
         latest_committed_checkpoint(Path(resumed_directory) / "checkpoints")
     )
+
+    # Compare actual serialized training-state fields.
+    # Timing, checkpoint content hashes, run-specific records and
+    # interruption history are deliberately excluded.
     state_fields = (
-        "completed_epoch", "next_epoch", "completed", "scale", "pending_quota",
-        "postwarm_step", "mask_cursor", "counters", "executed_exact_mask",
-        "executed_head_mask", "replay_schedule_mask", "replay_epoch_offsets",
-        "data_order_hashes", "target_attainment",
+        "stage",
+        "completed_epoch",
+        "next_epoch",
+        "completed",
+        "global_step",
+        "postwarm_step",
+        "pending_quota",
+        "exact_trunk_backwards",
+        "synthetic_backwards",
+        "zero_backwards",
+        "skipped_slots",
+        "trunk_optimizer_steps",
+        "head_optimizer_steps",
+        "predictor_fits",
+        "predictor_inferences",
+        "scale",
+        "lr_global_epoch",
+        "mask_cursor",
+        "executed_exact_mask",
+        "executed_head_mask",
+        "replay_schedule_mask",
+        "replay_epoch_offsets",
+        "mask_epoch_offsets",
+        "checkpoint_sequence",
+        "data_order_hashes",
+        "target_attainment",
     )
+
     fields = {
         "model": _state_tree_equal(left["model"], right["model"]),
         "predictor": _state_tree_equal(left["predictor"], right["predictor"]),

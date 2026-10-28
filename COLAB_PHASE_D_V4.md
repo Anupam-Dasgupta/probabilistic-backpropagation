@@ -20,7 +20,9 @@ These are the tested compatible PyTorch/torchvision versions. On Colab, first
 inspect the preinstalled GPU stack instead of blindly reinstalling it:
 
 ```python
-import sys, torch, torchvision, numpy
+import os, sys
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+import torch, torchvision, numpy
 print(sys.version)
 print(torch.__version__, torchvision.__version__, numpy.__version__)
 print(torch.cuda.is_available(), torch.version.cuda)
@@ -34,14 +36,22 @@ build tag.
 
 ## Tests
 
-From the repository root, run the complete engineering suite:
+From the repository root, use the supported launcher for the complete engineering
+suite:
 
 ```bash
-python -B -m unittest discover -s tests -v
+python -B run_phase_d_v4_tests.py
 ```
 
-The tests use only generated tensors and temporary local directories. They do
-not load CIFAR-10, download data, contact Drive, or launch a scientific run.
+The launcher sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` before any test imports
+PyTorch or initializes CUDA. Strict deterministic algorithms remain enabled.
+Launching discovery directly after another module has initialized CUDA is not a
+supported equivalent and can produce cuBLAS determinism initialization errors.
+
+Training tests use generated tensors and temporary local directories. The
+preservation/readiness tests also read (but never modify or extract locally) the
+existing historical results tree/archive. They do not load CIFAR-10, download
+data, contact Drive, or launch a scientific run.
 
 ## Audit and synthetic smoke
 
@@ -214,8 +224,23 @@ The runnable cells are in `PHASE_D_V4_COLAB.ipynb`. Every subprocess uses
 resume, profile, or analysis command prevents dependent work. A fresh **Run all**
 stops in cell 6 at a default-false executable guard before dataset download.
 Run cells 1–5 only for environment/source verification and synthetic smoke.
-Cells 6–9 require explicit real-data-preflight approval; cells 11–15 require a
+Cells 6–9 require explicit real-data-preflight approval; cells 11–17 require a
 separate full-pilot approval. The essential sequence is repeated below.
+
+### Fresh-clone files required before tests
+
+A Git clone intentionally excludes `cifar_d_resnet_v3/`. Before cells 3–4,
+upload the existing `cifar_d_resnet_v3.zip` into the repository root, alongside
+`AGENTS.md`. Its required SHA-256 is
+`469dbc42283afe1ace2c8fe29dbdebcee3b22ff6092358ec503b2cdb2920e127`, size
+998,800,703 bytes, and its only top-level extraction root is
+`cifar_d_resnet_v3/`. The notebook verifies the archive and safe member layout,
+extracts it only when the results directory is absent, then verifies the
+extracted 44-file tree against `configs/phase_d_v4_reference_manifest.json`
+before running the full preservation test. Do not upload it under `/content/data`
+or alter/repack it. No dataset, `archive/` directory, or historical source copy
+is needed for environment checks and synthetic smoke beyond the repository files
+and this results archive.
 
 ### 1. Verify the T4 and source identities
 
@@ -231,7 +256,7 @@ record hashes for every v4 Python module, the resolved reference config, and
 ### 2. Run tests and the required synthetic resume smoke
 
 ```bash
-python -B -m unittest discover -s tests -p 'test_phase_d_v4*.py' -v
+python -B run_phase_d_v4_tests.py
 python -B gradient_phase_d_resnet_v4.py audit --device cuda
 python -B gradient_phase_d_resnet_v4.py smoke --device cuda \
   --out /content/phase_d_v4_smoke --stop-after-global-epoch 0
@@ -372,12 +397,118 @@ its `.commit.json` marker last. Copy time remains in checkpoint/log I/O. Ignore
 only with local directory fixtures; Drive mounting, latency, disconnection, and
 recovery remain Colab-only checks.
 
-On recovery, restore the manifest, journal, resolved config, split and manifest,
-donor mask and manifest where applicable, and the latest marker-verified checkpoint
-to the original local run layout. Resume with both execution flags and the same
+On recovery, restore the saved run-order manifest, resolved configs, split and
+manifest, donor mask and manifest where applicable, and the marker-verified
+checkpoint retention set to the original local layout. The retained set includes
+the latest and preceding boundaries, warm-up-final boundary, available post-warm
+probe boundaries 1/6/12, earliest committed boundary, and first-attainment
+boundaries. The pre-block profile CSV/summary is restored as a prior measurement;
+its absence is a hard failure and never triggers silent re-profiling. Resume with
+both execution flags and the same
 `--persistence-dir` from that epoch boundary. Record repeated incomplete epochs and downtime; resumed
-runs may contribute accuracy evidence after equivalence checks but are not clean
-uninterrupted timing benchmarks.
+runs may contribute accuracy evidence after continuation checks but are not clean
+uninterrupted timing benchmarks. File restoration itself does not download data;
+cell 14 performs only verified restoration, cell 15 owns the separate
+`AUTHORIZE_RECOVERY_DATA_SETUP=False` gate, and cell 16 owns the independent
+`AUTHORIZE_RECOVERY_CONTINUATION=False` gate. Each cell can be run later without
+repeating or deleting a valid earlier stage.
+
+
+### Verified epoch recovery snapshots
+
+When `--persistence-dir` is enabled, every completed epoch writes:
+
+- A checksum-verified immutable checkpoint and commit marker.
+- An epoch-specific snapshot of run metadata and derived outputs.
+- A `snapshot.ready.json` marker published only after all support files are verified.
+- A checksum-committed `snapshot.timing.json` record. Recovery rejects snapshots
+  lacking it and uses it to add snapshot work exactly once to checkpoint/log I/O.
+
+The recovery workflow selects the newest fully verified snapshot and restores
+it into a fresh local run directory. Rerunning restoration reuses the directory
+only after every snapshot file and the latest committed checkpoint are verified
+against the same newest remote snapshot; it never overwrites existing local state.
+
+Immutable resolved configs, dataset split artifacts, donor masks, the saved
+run-order manifest, and resource/pre-block profile records are backed up
+separately under `_study_support`. Support copies are checksum-verified and
+restore refuses existing differences.
+
+The notebook distinguishes three cases:
+
+1. Fresh run: execute `run`.
+2. Existing incomplete local run: execute `resume`.
+3. New Colab session: restore support files and a verified snapshot, then
+   explicitly authorize `resume`.
+
+Strict recovery remains the notebook default and requires the complete original
+execution fingerprint, including the physical GPU UUID. For a Colab VM replacement,
+set `RECOVERY_COMPATIBILITY = COMPATIBLE_T4_RESUME_POLICY` explicitly in the
+recovery cell. The versioned policy accepts only a different physical UUID/index
+and detailed VM platform/CPU description when both devices are NVIDIA T4s with
+compute capability 7.5 and equal reported memory, and the Python/PyTorch/
+torchvision/NumPy/CUDA/cuDNN/driver, OS family/architecture, device count,
+precision, TF32, cuBLAS workspace, deterministic backend, resolved execution
+configuration, source, data, mask, optimizer, and controller identities remain
+compatible. Missing legacy evidence, another GPU model, or any required mismatch
+stops before the run/donor snapshot is restored.
+
+The display-driver release is queried separately from the CUDA runtime/build by
+a bounded `nvidia-smi --query-gpu=driver_version` call. The environment records
+the query source, status, version, and failure detail. Compatible-T4 recovery
+requires valid `status=ok` evidence and an exact driver-version match; missing,
+placeholder, failed, or legacy-absent evidence is rejected.
+
+The original environment and execution fingerprint remain immutable. Recovery
+appends the replacement environment, current execution fingerprint, policy
+version, and transition to the session history. It records work by session,
+reports recovery overhead separately, and leaves the interruption gap null
+because browser/VM downtime cannot be reconstructed reliably. Cross-device
+resumed trajectories may enter labeled accuracy analysis after the copied-state
+continuation check. They are not new seeds and are excluded from clean timing,
+speed, Pareto, or end-to-end efficiency comparisons; no cross-device timing
+normalization is performed.
+
+Before continuation begins, each resume writes an immutable, checksum-marked
+`resume_attempts/attempt_*.json` record locally and, when persistence is enabled,
+to that run's persistence directory. If a VM disappears before the next epoch
+checkpoint, the next recovery loads these records, identifies another attempt
+from the same committed sequence, and records the repeated incomplete epoch.
+Corrupt or conflicting committed attempt records stop recovery; partial files are
+not accepted. Preparation time recorded before the attempt commit and successful
+session recovery overhead remain separate from scientific training time.
+
+The authoritative `resume` runner—not the notebook—executes one fixed synthetic exact update twice from
+independent copies of the restored production checkpoint using the M1 device
+tolerances. It restores process RNG and never mutates the checkpoint or live
+training state. The result is bound to the checkpoint hash, environment,
+execution fingerprint, and resume-attempt ID, then checksum-persisted locally
+and to Drive before production updates. Analysis rejects cross-device accuracy
+eligibility when this evidence is missing or invalid. This verifies deterministic load/optimizer continuation on the
+replacement allocation; it does **not** prove numerical equivalence between two
+physical T4s or validate scientific accuracy. The two-allocation Colab check is:
+
+1. On allocation A, complete at least one epoch, verify the Drive snapshot and
+   its timing marker, and record the environment/session in the manifest.
+2. Use Colab **Disconnect and delete runtime** so allocation A is gone. A browser
+   disconnect alone leaves Python/GPU state alive; a Python runtime restart may
+   retain the VM/GPU and should normally use strict recovery.
+3. On allocation B, run environment/source checks, mount the same Drive, select
+   the explicit compatible-T4 policy, and run restoration cell 14. It must display
+   a different UUID, an allowed transition report, and verified checkpoint/support
+   hashes. No dataset or continuation runs in this cell.
+4. After separate dataset authorization, set the gate in cell 15 and reconstruct
+   or verify the cache. Stop again. After separate full-pilot authorization, set
+   the continuation gate in cell 16 and run it once. The runner performs and
+   persists the continuation check before production updates. Do not auto-retry. Inspect the manifest for two
+   execution sessions, an unknown interruption gap, and the cross-device label.
+
+To simulate disconnect locally without claiming cross-T4 evidence, run a tiny
+synthetic job with persistence into a temporary directory, delete only its local
+run directory, restore the verified snapshot into a fresh path, and resume under
+strict mode. Compatibility unit tests may alter fixture UUID strings, but those
+tests prove policy behavior only, not hardware numerical equivalence.
+
 
 ### 8. Read-only analysis
 

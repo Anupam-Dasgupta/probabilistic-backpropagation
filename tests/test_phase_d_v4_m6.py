@@ -189,6 +189,95 @@ class AnalysisMathematicsTests(unittest.TestCase):
         self.assertEqual(averaged[0]["replica_count"], 2)
         self.assertFalse(averaged[0]["replicas_are_independent_seeds"])
         self.assertAlmostEqual(averaged[0]["final_accuracy"], 0.82)
+        reversed_average = average_replica_records_within_seed(list(reversed(replicas)))
+        self.assertEqual(
+            json.dumps(averaged, sort_keys=True),
+            json.dumps(reversed_average, sort_keys=True),
+        )
+
+    def test_replica_averaging_rejects_missing_null_duplicate_and_invalid_ids(self) -> None:
+        """Repeated replica groups require distinct nonnegative integer identities.
+
+        Fabricated repeated gap groups cover absent, null, duplicate, negative,
+        string, floating, and boolean identities plus a repeated ordinary method.
+        Every malformed group raises clearly without converting nulls or other
+        values into fabricated IDs; inputs, files, RNG, and devices are unchanged.
+        """
+
+        invalid_pairs = (
+            ({}, {"mask_replicate": 1}),
+            ({"mask_replicate": None}, {"mask_replicate": 1}),
+            ({"mask_replicate": 0}, {"mask_replicate": 0}),
+            ({"mask_replicate": -1}, {"mask_replicate": 1}),
+            ({"mask_replicate": "0"}, {"mask_replicate": 1}),
+            ({"mask_replicate": 0.0}, {"mask_replicate": 1}),
+            ({"mask_replicate": False}, {"mask_replicate": 1}),
+        )
+        for first_identity, second_identity in invalid_pairs:
+            with self.subTest(first=first_identity, second=second_identity):
+                first = _record("relative_gap_permutation_epoch", 3, 0.80)
+                second = _record("relative_gap_permutation_epoch", 3, 0.81)
+                first.update(run_id="gap-a", **first_identity)
+                second.update(run_id="gap-b", **second_identity)
+                with self.assertRaisesRegex(ValueError, "replica"):
+                    average_replica_records_within_seed([first, second])
+        ordinary = [_record("exact", 3, 0.80), _record("exact", 3, 0.81)]
+        ordinary[0]["mask_replicate"] = 0
+        ordinary[1]["mask_replicate"] = 1
+        with self.assertRaisesRegex(ValueError, "duplicate non-random"):
+            average_replica_records_within_seed(ordinary)
+
+    def test_replica_averaging_conservatively_combines_recovery_restrictions(self) -> None:
+        """Any resumed, cross-device, or timing-ineligible replica blocks timing.
+
+        Fabricated two-replica groups cover each restriction and reversed input
+        order. Accuracy remains one seed-level observation, provenance lists are
+        retained, and paired timing/Pareto consumers reject the aggregate. Inputs
+        are copied and no files, RNG, devices, or scientific results are touched.
+        """
+
+        scenarios = (
+            {"resumed": True},
+            {"cross_device_resumed": True},
+            {"clean_timing_comparison_eligible": False},
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                replicas = []
+                for replica in (0, 1):
+                    record = _record("relative_gap_permutation_epoch", 4, 0.80 + 0.01 * replica)
+                    record.update(
+                        run_id=f"gap-s4-r{replica}",
+                        mask_replicate=replica,
+                        execution_fingerprint=f"execution-{replica}",
+                        environment={"device_uuid": f"GPU-{replica}"},
+                        execution_sessions=[{"session_index": 0, "cross_device": False}],
+                        accuracy_comparison_eligible=True,
+                        clean_timing_comparison_eligible=True,
+                        cross_device_resumed=False,
+                        continuation_evidence_valid=True,
+                    )
+                    record["epochs"] = [{
+                        "global_epoch": 0,
+                        "validation_accuracy": record["final_accuracy"],
+                        "validation_ce": 1.0,
+                        "observation_time_seconds": 10.0,
+                    }]
+                    replicas.append(record)
+                replicas[1].update(scenario)
+                forward = average_replica_records_within_seed(replicas)[0]
+                reverse = average_replica_records_within_seed(list(reversed(replicas)))[0]
+                self.assertEqual(
+                    json.dumps(forward, sort_keys=True), json.dumps(reverse, sort_keys=True)
+                )
+                self.assertTrue(forward["accuracy_comparison_eligible"])
+                self.assertFalse(forward["clean_timing_comparison_eligible"])
+                self.assertEqual(forward["replica_run_ids"], ["gap-s4-r0", "gap-s4-r1"])
+                self.assertEqual(len(forward["replica_environments"]), 2)
+                reference = _record("reference", 4, 0.80)
+                with self.assertRaisesRegex(ValueError, "resumed"):
+                    paired_time_ratio([reference, forward], "reference", "relative_gap_permutation_epoch")
+                self.assertEqual(deployment_pareto([forward]), [])
 
     def test_accuracy_plots_use_all_observed_epoch_and_time_points(self) -> None:
         """Fabricated endpoint records create both planned descriptive figures."""
@@ -267,6 +356,31 @@ class OrderingAndIntegrationTests(unittest.TestCase):
         self.assertEqual(second["measured_block"], first["measured_block"][1:] + first["measured_block"][:1])
         self.assertFalse(hardware_drift_check([10, 10, 10], [10.5, 10.5, 10.5])["flagged"])
         self.assertTrue(hardware_drift_check([10, 10, 10], [11.1, 11.1, 11.1])["flagged"])
+
+    def test_validated_nonreplica_run_passes_analysis_aggregation(self) -> None:
+        """A real validated tiny run with null replica identity reaches analysis.
+
+        A complete two-epoch synthetic runner output is validated through the
+        production schema, then passed through seed-level aggregation and the
+        deployable Pareto path. The ordinary null ``mask_replicate`` is preserved;
+        no CIFAR data, network, download, or scientific experiment is used.
+        """
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            run = Path(temporary) / "ordinary"
+            config = _runner_config(run, warmup_epochs=1, postwarm_epochs=1)
+            train, validation, _ = _synthetic_fixture(seed=7441)
+            run_training(
+                config, train, validation, run, "cpu",
+                artifacts=_artifacts(), data_identities=_identities(),
+            )
+            validated = validate_run_directory(run)
+            self.assertIsNone(validated["mask_replicate"])
+            aggregated = average_replica_records_within_seed([validated])
+            self.assertEqual(len(aggregated), 1)
+            self.assertIsNone(aggregated[0]["mask_replicate"])
+            self.assertEqual(aggregated[0]["run_id"], validated["run_id"])
+            self.assertEqual(deployment_pareto(aggregated)[0]["run_id"], validated["run_id"])
 
     def test_split_indices_follow_private_torch_permutation(self) -> None:
         """Small split construction matches the frozen prefix rule without RNG leakage."""

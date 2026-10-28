@@ -11,10 +11,13 @@ import copy
 import csv
 import hashlib
 import json
+import math
 import os
 import platform
 import random
+import re
 import shutil
+import subprocess
 import time
 from importlib import metadata as importlib_metadata
 from dataclasses import dataclass, field
@@ -273,6 +276,43 @@ class TimingLedger:
     components: dict[str, float] = field(default_factory=dict)
     checkpoint_io: list[dict[str, Any]] = field(default_factory=list)
     incomplete: list[str] = field(default_factory=list)
+    sessions: list[dict[str, Any]] = field(default_factory=list)
+
+    def begin_session(
+        self,
+        environment: Mapping[str, Any],
+        execution_fingerprint_value: str,
+        *,
+        policy: str,
+        cross_device: bool,
+        checkpoint_sequence: int,
+        resume_attempt_id: int | None = None,
+    ) -> None:
+        """Start one execution-session timing bucket without adding elapsed time.
+
+        Inputs identify the environment, execution hash, recovery policy, whether
+        the physical GPU changed, and committed checkpoint used as the boundary.
+        Nothing is returned. A new mutable session record is appended; the prior
+        record and all cumulative components remain unchanged. Interruption gap is
+        explicitly unknown because a checkpoint contains no trustworthy wall-clock
+        end time for a disconnected runtime.
+        """
+
+        self.sessions.append(
+            {
+                "session_index": len(self.sessions),
+                "environment": _json_copy(environment),
+                "execution_fingerprint": str(execution_fingerprint_value),
+                "resume_policy": str(policy),
+                "cross_device": bool(cross_device),
+                "started_from_checkpoint_sequence": int(checkpoint_sequence),
+                "resume_attempt_id": (
+                    None if resume_attempt_id is None else int(resume_attempt_id)
+                ),
+                "interruption_gap_seconds": None,
+                "components": {},
+            }
+        )
 
     def add(self, component: str, seconds: float) -> None:
         """Add a finite nonnegative duration to one named ledger component."""
@@ -282,6 +322,9 @@ class TimingLedger:
         if not isinstance(seconds, (int, float)) or not np.isfinite(seconds) or seconds < 0:
             raise ValueError("timing duration must be finite and nonnegative")
         self.components[component] = self.components.get(component, 0.0) + float(seconds)
+        if self.sessions:
+            values = self.sessions[-1]["components"]
+            values[component] = values.get(component, 0.0) + float(seconds)
 
     def totals(self) -> dict[str, float]:
         """Return planned learning, evaluated, workflow, and post-warm totals."""
@@ -316,6 +359,7 @@ class TimingLedger:
             "components": copy.deepcopy(self.components),
             "checkpoint_io": copy.deepcopy(self.checkpoint_io),
             "incomplete": list(self.incomplete),
+            "sessions": copy.deepcopy(self.sessions),
             "totals": self.totals(),
         }
 
@@ -327,10 +371,17 @@ class TimingLedger:
             components={key: float(value) for key, value in values.get("components", {}).items()},
             checkpoint_io=copy.deepcopy(values.get("checkpoint_io", [])),
             incomplete=list(values.get("incomplete", [])),
+            sessions=copy.deepcopy(values.get("sessions", [])),
         )
         for component, seconds in ledger.components.items():
             if not component or seconds < 0 or not np.isfinite(seconds):
                 raise ValueError("invalid timing ledger component")
+        for index, session in enumerate(ledger.sessions):
+            if int(session.get("session_index", -1)) != index:
+                raise ValueError("invalid timing session ordering")
+            for seconds in session.get("components", {}).values():
+                if float(seconds) < 0 or not np.isfinite(float(seconds)):
+                    raise ValueError("invalid timing session component")
         return ledger
 
 
@@ -841,12 +892,182 @@ CONTROLLER_EVENT_COLUMNS = (
     "checkpoint_sequence",
 )
 
+RESUME_COMPATIBILITY_POLICY_VERSION = "phase_d_v4.resume_compatibility.v1"
+STRICT_RESUME_POLICY = "strict_execution"
+COMPATIBLE_T4_RESUME_POLICY = "compatible_nvidia_t4"
+RESUME_COMPATIBILITY_POLICIES = (STRICT_RESUME_POLICY, COMPATIBLE_T4_RESUME_POLICY)
+
 
 def execution_fingerprint(config: RunConfig, environment: Mapping[str, Any]) -> str:
     """Hash execution settings and resolved environment without paths or timestamps."""
 
     payload = {"execution": config.to_dict()["execution"], "environment": _json_copy(environment)}
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _query_nvidia_driver_version(device_index: int) -> dict[str, Any]:
+    """Read the installed NVIDIA display-driver version with a bounded query.
+
+    The input is a nonnegative CUDA device index. The returned mapping always has
+    ``status``, ``source``, ``version``, and ``detail`` fields. ``nvidia-smi`` is
+    invoked once with a five-second timeout; its display-driver release is kept
+    distinct from PyTorch's CUDA build/runtime version. Missing executables,
+    timeouts, nonzero exits, empty output, and placeholder values are reported
+    explicitly rather than converted to a version. No driver, backend, RNG, or
+    file state is changed.
+    """
+
+    if device_index < 0:
+        raise ValueError("CUDA device index must be nonnegative")
+    command = [
+        "nvidia-smi",
+        f"--id={device_index}",
+        "--query-gpu=driver_version",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"status": "unavailable", "source": "nvidia-smi", "version": None, "detail": "executable_not_found"}
+    except subprocess.TimeoutExpired:
+        return {"status": "failed", "source": "nvidia-smi", "version": None, "detail": "timeout"}
+    except OSError as exc:
+        return {"status": "failed", "source": "nvidia-smi", "version": None, "detail": f"os_error:{type(exc).__name__}"}
+    if completed.returncode != 0:
+        return {
+            "status": "failed",
+            "source": "nvidia-smi",
+            "version": None,
+            "detail": f"exit_code:{completed.returncode}",
+        }
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    version = lines[0] if len(lines) == 1 else None
+    if version is None or re.fullmatch(r"\d+(?:\.\d+)+", version) is None:
+        return {"status": "unknown", "source": "nvidia-smi", "version": None, "detail": "invalid_or_ambiguous_output"}
+    return {"status": "ok", "source": "nvidia-smi", "version": version, "detail": None}
+
+
+def resume_compatibility_report(
+    saved_config: RunConfig,
+    saved_environment: Mapping[str, Any],
+    current_config: RunConfig,
+    current_environment: Mapping[str, Any],
+    policy: str = STRICT_RESUME_POLICY,
+) -> dict[str, Any]:
+    """Validate one saved execution against an explicitly selected resume policy.
+
+    Inputs are the saved/current resolved configurations and complete environment
+    records plus a versioned policy name. The returned JSON-like report records
+    required comparisons, provenance-only changes, both execution fingerprints,
+    and whether the physical GPU changed. It does not mutate files, devices, RNG,
+    or backend flags. Strict mode requires identical execution identity.
+    Compatible-T4 mode permits only UUID, device index, detailed Linux platform
+    string, and CPU-description changes; missing legacy evidence or any required
+    hardware/software/backend mismatch raises before state restoration.
+    """
+
+    if policy not in RESUME_COMPATIBILITY_POLICIES:
+        raise ValueError(f"unsupported resume compatibility policy: {policy}")
+    saved_execution = saved_config.to_dict()["execution"]
+    current_execution = current_config.to_dict()["execution"]
+    if canonical_json(saved_execution) != canonical_json(current_execution):
+        raise ValueError("resolved execution configuration differs from checkpoint")
+    saved_fingerprint = execution_fingerprint(saved_config, saved_environment)
+    current_fingerprint = execution_fingerprint(current_config, current_environment)
+    if policy == STRICT_RESUME_POLICY:
+        if saved_fingerprint != current_fingerprint:
+            raise ValueError(
+                "strict resume execution fingerprint differs; the physical GPU UUID "
+                "and complete saved execution environment must match"
+            )
+        return {
+            "policy_version": RESUME_COMPATIBILITY_POLICY_VERSION,
+            "policy": policy,
+            "compatible": True,
+            "cross_device": False,
+            "saved_execution_fingerprint": saved_fingerprint,
+            "current_execution_fingerprint": current_fingerprint,
+            "required_fields": sorted(saved_environment),
+            "provenance_only_changes": {},
+        }
+
+    provenance_only = {"device_uuid", "device_index", "platform", "processor"}
+    required = {
+        "python", "system", "machine", "torch", "torchvision", "numpy",
+        "cuda_runtime", "cudnn", "device_type", "device_name",
+        "device_capability", "total_memory_bytes", "driver_version", "driver_query",
+        "cuda_device_count", "cublas_workspace_config", "matmul_tf32",
+        "cudnn_tf32", "cudnn_benchmark", "cudnn_deterministic",
+        "deterministic_algorithms",
+    }
+    missing = sorted(
+        key for key in required | {"device_uuid"}
+        if key not in saved_environment or key not in current_environment
+    )
+    if missing:
+        raise ValueError(
+            "legacy checkpoint lacks fields required by compatible-T4 policy: "
+            + ", ".join(missing)
+        )
+    for label, environment in (("saved", saved_environment), ("current", current_environment)):
+        query = environment.get("driver_query")
+        version = environment.get("driver_version")
+        if (
+            not isinstance(query, Mapping)
+            or query.get("status") != "ok"
+            or query.get("source") != "nvidia-smi"
+            or not isinstance(version, str)
+            or re.fullmatch(r"\d+(?:\.\d+)+", version) is None
+            or query.get("version") != version
+        ):
+            raise ValueError(f"compatible-T4 recovery lacks valid {label} NVIDIA driver evidence")
+    allowed_t4_names = {"NVIDIA T4", "Tesla T4"}
+    if (
+        saved_environment["device_type"] != "cuda"
+        or current_environment["device_type"] != "cuda"
+        or saved_environment["device_name"] not in allowed_t4_names
+        or current_environment["device_name"] not in allowed_t4_names
+        or list(saved_environment["device_capability"]) != [7, 5]
+        or list(current_environment["device_capability"]) != [7, 5]
+    ):
+        raise ValueError("compatible-T4 recovery requires NVIDIA T4 compute capability 7.5")
+    mismatches = {
+        key: {"saved": saved_environment.get(key), "current": current_environment.get(key)}
+        for key in sorted(required - {"device_name"})
+        if canonical_json(saved_environment.get(key))
+        != canonical_json(current_environment.get(key))
+    }
+    if mismatches:
+        raise ValueError(
+            "compatible-T4 recovery has required environment mismatches: "
+            + ", ".join(mismatches)
+        )
+    changes = {
+        key: {"saved": saved_environment.get(key), "current": current_environment.get(key)}
+        for key in sorted(provenance_only)
+        if canonical_json(saved_environment.get(key))
+        != canonical_json(current_environment.get(key))
+    }
+    saved_uuid = str(saved_environment["device_uuid"])
+    current_uuid = str(current_environment["device_uuid"])
+    if not saved_uuid or not current_uuid:
+        raise ValueError("compatible-T4 recovery requires nonempty saved/current GPU UUIDs")
+    return {
+        "policy_version": RESUME_COMPATIBILITY_POLICY_VERSION,
+        "policy": policy,
+        "compatible": True,
+        "cross_device": saved_uuid != current_uuid,
+        "saved_execution_fingerprint": saved_fingerprint,
+        "current_execution_fingerprint": current_fingerprint,
+        "required_fields": sorted(required),
+        "provenance_only_changes": changes,
+    }
 
 
 def environment_metadata(device: torch.device | str) -> dict[str, Any]:
@@ -856,6 +1077,8 @@ def environment_metadata(device: torch.device | str) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "python": platform.python_version(),
         "platform": platform.platform(),
+        "system": platform.system(),
+        "machine": platform.machine(),
         "processor": platform.processor(),
         "torch": str(torch.__version__),
         "torchvision": importlib_metadata.version("torchvision"),
@@ -863,6 +1086,7 @@ def environment_metadata(device: torch.device | str) -> dict[str, Any]:
         "cuda_runtime": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),
         "device_type": selected.type,
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         "matmul_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
         "cudnn_tf32": bool(torch.backends.cudnn.allow_tf32),
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
@@ -878,12 +1102,19 @@ def environment_metadata(device: torch.device | str) -> dict[str, Any]:
             device_index=index,
             device_name=properties.name,
             device_uuid=str(getattr(properties, "uuid", "")),
+            device_capability=[int(properties.major), int(properties.minor)],
             total_memory_bytes=int(properties.total_memory),
-            driver_version=(
-                int(torch._C._cuda_getDriverVersion())
-                if hasattr(torch._C, "_cuda_getDriverVersion") else None
-            ),
+            cuda_device_count=int(torch.cuda.device_count()),
         )
+        driver_query = _query_nvidia_driver_version(index)
+        metadata["driver_query"] = driver_query
+        metadata["driver_version"] = driver_query["version"]
+    else:
+        metadata["driver_query"] = {
+            "status": "not_applicable", "source": "nvidia-smi",
+            "version": None, "detail": "non_cuda_device",
+        }
+        metadata["driver_version"] = None
     return metadata
 
 
@@ -1411,3 +1642,735 @@ def copy_file_verified(
         {"sha256": digest, "size_bytes": size, "source_name": source.name},
     )
     return destination
+
+
+def load_resume_attempts(
+    run_directory: str | os.PathLike[str],
+    persistence_directory: str | os.PathLike[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Load every checksum-committed resume-attempt record in order.
+
+    Inputs identify the local run and optional verified persistence directory.
+    The returned records merge identical attempt IDs, prefer neither location,
+    and reject corrupt/conflicting committed copies. Missing directories and
+    uncommitted partial files contribute nothing. No files, RNG, or training
+    state are changed.
+    """
+
+    roots = [Path(run_directory) / "resume_attempts"]
+    if persistence_directory is not None:
+        roots.append(Path(persistence_directory) / "resume_attempts")
+    by_id: dict[int, dict[str, Any]] = {}
+    for root in roots:
+        for marker_path in sorted(root.glob("attempt_*.json.commit.json")):
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            record_path = marker_path.with_name(marker_path.name.removesuffix(".commit.json"))
+            if (
+                not record_path.is_file()
+                or sha256_file(record_path) != marker.get("sha256")
+                or record_path.stat().st_size != int(marker.get("size_bytes", -1))
+            ):
+                raise ValueError("resume-attempt record checksum mismatch")
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            attempt_id = int(record.get("attempt_id", -1))
+            if attempt_id < 0:
+                raise ValueError("resume-attempt record lacks a valid identity")
+            if attempt_id in by_id and canonical_json(by_id[attempt_id]) != canonical_json(record):
+                raise ValueError("conflicting local and persisted resume-attempt records")
+            by_id[attempt_id] = record
+    return [by_id[key] for key in sorted(by_id)]
+
+
+def record_resume_attempt(
+    run_directory: str | os.PathLike[str],
+    persistence_directory: str | os.PathLike[str] | None,
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append one immutable resume-attempt record before continuation starts.
+
+    Inputs identify local/optional persistence locations and a JSON-like record.
+    The returned record gains the next monotonic attempt ID. It is atomically
+    written locally and, when enabled, copied with checksum marker to persistence.
+    Existing attempt files are never overwritten, so a later recovery can detect
+    repeated work from the same committed epoch. Failures raise before training;
+    no model, optimizer, controller, loader, or RNG state is changed.
+    """
+
+    existing = load_resume_attempts(run_directory, persistence_directory)
+    values = _json_copy(record)
+    values["attempt_id"] = 0 if not existing else int(existing[-1]["attempt_id"]) + 1
+    local = Path(run_directory) / "resume_attempts" / f"attempt_{values['attempt_id']:06d}.json"
+    if local.exists():
+        raise FileExistsError("resume-attempt identity already exists")
+    atomic_write_json(local, values)
+    local_marker = {
+        "sha256": sha256_file(local),
+        "size_bytes": local.stat().st_size,
+        "source_name": local.name,
+    }
+    atomic_write_json(local.with_suffix(local.suffix + ".commit.json"), local_marker)
+    if persistence_directory is not None:
+        copy_file_verified(
+            local,
+            Path(persistence_directory) / "resume_attempts" / local.name,
+        )
+    return values
+
+
+def load_continuation_evidence(
+    run_directory: str | os.PathLike[str],
+    persistence_directory: str | os.PathLike[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Load checksum-committed cross-device continuation evidence in order.
+
+    Inputs identify a local run and optional persistence directory. The returned
+    records are merged by resume-attempt ID and require identical local/remote
+    content, valid checksums, and a successful copied-state status. Corrupt,
+    conflicting, or malformed committed evidence raises before training. Missing
+    directories and partial files are ignored; no state or files are modified.
+    """
+
+    roots = [Path(run_directory) / "continuation_checks"]
+    if persistence_directory is not None:
+        roots.append(Path(persistence_directory) / "continuation_checks")
+    by_id: dict[int, dict[str, Any]] = {}
+    for root in roots:
+        for marker_path in sorted(root.glob("attempt_*.json.commit.json")):
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            record_path = marker_path.with_name(marker_path.name.removesuffix(".commit.json"))
+            if (
+                not record_path.is_file()
+                or sha256_file(record_path) != marker.get("sha256")
+                or record_path.stat().st_size != int(marker.get("size_bytes", -1))
+            ):
+                raise ValueError("continuation evidence checksum mismatch")
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            attempt_id = int(record.get("resume_attempt_id", -1))
+            if (
+                attempt_id < 0
+                or record.get("status") != "copied_state_deterministic_continuation_passed"
+                or record.get("production_state_mutated") is not False
+            ):
+                raise ValueError("continuation evidence identity or status is invalid")
+            if attempt_id in by_id and canonical_json(by_id[attempt_id]) != canonical_json(record):
+                raise ValueError("conflicting local and persisted continuation evidence")
+            by_id[attempt_id] = record
+    return [by_id[key] for key in sorted(by_id)]
+
+
+def record_continuation_evidence(
+    run_directory: str | os.PathLike[str],
+    persistence_directory: str | os.PathLike[str] | None,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist one immutable successful continuation check for a resume attempt.
+
+    Inputs identify local/optional persistence locations and evidence already
+    bound to a checkpoint, environment, and attempt. The returned primitive
+    record is written atomically with checksum markers locally and remotely.
+    Existing evidence is never overwritten; invalid status or IDs raise before
+    writing. This changes only evidence files and has no training/RNG side effect.
+    """
+
+    values = _json_copy(evidence)
+    attempt_id = int(values.get("resume_attempt_id", -1))
+    if (
+        attempt_id < 0
+        or values.get("status") != "copied_state_deterministic_continuation_passed"
+        or values.get("production_state_mutated") is not False
+    ):
+        raise ValueError("only successful bound continuation evidence may be persisted")
+    existing = load_continuation_evidence(run_directory, persistence_directory)
+    if any(int(item["resume_attempt_id"]) == attempt_id for item in existing):
+        raise FileExistsError("continuation evidence already exists for resume attempt")
+    local = Path(run_directory) / "continuation_checks" / f"attempt_{attempt_id:06d}.json"
+    atomic_write_json(local, values)
+    marker = {
+        "sha256": sha256_file(local),
+        "size_bytes": local.stat().st_size,
+        "source_name": local.name,
+    }
+    atomic_write_json(local.with_suffix(local.suffix + ".commit.json"), marker)
+    if persistence_directory is not None:
+        copy_file_verified(
+            local,
+            Path(persistence_directory) / "continuation_checks" / local.name,
+        )
+    return values
+
+
+def backup_study_support(
+    source_file: str | os.PathLike[str],
+    study_root: str | os.PathLike[str],
+    persistence_root: str | os.PathLike[str],
+) -> Path:
+    """Back up one study-local support file under its verified relative path.
+
+    Inputs are an existing file, the local study root that must contain it, and
+    one persistence root. The returned immutable copy is placed below
+    ``_study_support`` with a checksum marker. Paths outside the study fail,
+    existing mismatches are rejected, and no source file is modified.
+    """
+
+    source = Path(source_file).resolve()
+    root = Path(study_root).resolve()
+    try:
+        relative = source.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("support artifact must be inside the study root") from exc
+    return copy_file_verified(
+        source, Path(persistence_root) / "_study_support" / relative
+    )
+
+
+def restore_study_support(
+    destination_file: str | os.PathLike[str],
+    study_root: str | os.PathLike[str],
+    persistence_root: str | os.PathLike[str],
+) -> Path:
+    """Restore one checksum-verified study support file without overwriting it.
+
+    Inputs identify the desired study-local path, study root, and persistence
+    root. The returned local file is copied through a temporary path after both
+    source and marker validation. Existing identical files are reused; existing
+    differences, path escape, missing markers, or corruption raise. No training,
+    RNG, device, or unrelated historical data is touched.
+    """
+
+    destination = Path(destination_file).resolve()
+    root = Path(study_root).resolve()
+    try:
+        relative = destination.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("support destination must be inside the study root") from exc
+    source = Path(persistence_root) / "_study_support" / relative
+    marker = source.with_suffix(source.suffix + ".commit.json")
+    if not source.is_file() or not marker.is_file():
+        raise FileNotFoundError(f"verified support artifact is missing: {source}")
+    metadata = json.loads(marker.read_text(encoding="utf-8"))
+    if (
+        sha256_file(source) != metadata.get("sha256")
+        or source.stat().st_size != int(metadata.get("size_bytes", -1))
+    ):
+        raise ValueError(f"support artifact checksum mismatch: {source}")
+    if destination.exists():
+        if (
+            sha256_file(destination) != metadata["sha256"]
+            or destination.stat().st_size != int(metadata["size_bytes"])
+        ):
+            raise FileExistsError(f"existing support artifact differs: {destination}")
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(destination.name + ".restore.partial")
+    shutil.copyfile(source, staging)
+    if (
+        sha256_file(staging) != metadata["sha256"]
+        or staging.stat().st_size != int(metadata["size_bytes"])
+    ):
+        staging.unlink(missing_ok=True)
+        raise IOError("restored support artifact failed checksum validation")
+    os.replace(staging, destination)
+    return destination
+
+
+def backup_resume_snapshot(
+    run_directory: str | os.PathLike[str],
+    persistence_directory: str | os.PathLike[str],
+    checkpoint: str | os.PathLike[str],
+) -> Path:
+    """Back up one committed epoch's complete recovery metadata.
+
+    The checkpoint is copied and verified first. Every support file is copied
+    to an epoch-specific snapshot, and snapshot.ready.json is written last.
+    An interrupted snapshot cannot replace a previously valid recovery point.
+    """
+
+    run = Path(run_directory)
+    remote = Path(persistence_directory)
+    source_checkpoint = Path(checkpoint)
+
+    remote_checkpoint = copy_checkpoint_verified(
+        source_checkpoint, remote / "checkpoints"
+    )
+
+    commit = json.loads(
+        source_checkpoint.with_suffix(
+            source_checkpoint.suffix + ".commit.json"
+        ).read_text(encoding="utf-8")
+    )
+    sequence = int(commit["checkpoint_sequence"])
+
+    snapshot = remote / "snapshots" / f"checkpoint_{sequence:06d}"
+    ready_path = snapshot / "snapshot.ready.json"
+
+    if ready_path.exists():
+        raise FileExistsError(
+            f"Recovery snapshot already committed: {ready_path}"
+        )
+
+    required = (
+        "manifest.json",
+        "checkpoint_journal.json",
+        "timing.json",
+        "epochs.csv",
+        "controller_events.csv",
+        "summary.json",
+        "masks.npz",
+        "mask_manifest.json",
+        "errors.jsonl",
+    )
+    optional = (
+        "calibration.json",
+        "replay_provenance.json",
+        "schedule_provenance.json",
+        "final_predictor.pt",
+    )
+
+    files = {}
+
+    for name in required + optional:
+        source = run / name
+
+        if not source.exists():
+            if name in required:
+                raise FileNotFoundError(
+                    f"Required recovery file missing: {source}"
+                )
+            continue
+
+        copied = copy_file_verified(source, snapshot / name)
+        files[name] = {
+            "sha256": sha256_file(copied),
+            "size_bytes": copied.stat().st_size,
+        }
+
+    ready = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run.name,
+        "checkpoint_sequence": sequence,
+        "checkpoint_file": remote_checkpoint.name,
+        "checkpoint_sha256": commit["sha256"],
+        "files": files,
+        "timing_record_required": True,
+    }
+
+    atomic_write_json(ready_path, ready)
+    return ready_path
+
+
+def commit_resume_snapshot_timing(
+    ready_path: str | os.PathLike[str], io_seconds: float
+) -> Path:
+    """Publish the measured snapshot duration after the snapshot commits.
+
+    Inputs are a committed ``snapshot.ready.json`` path and the finite,
+    nonnegative checkpoint/log/persistence duration in seconds measured by the
+    caller. The returned timing-record path is written atomically and receives a
+    checksum marker last. Recovery rejects snapshots without this record, so a
+    crash cannot make an incompletely timed workflow look comparison-eligible.
+    The small journal publication itself follows the plan's post-commit timing
+    convention and is not recursively charged to its own duration.
+    """
+
+    ready_file = Path(ready_path)
+    if not ready_file.is_file():
+        raise FileNotFoundError("snapshot ready marker is missing")
+    seconds = float(io_seconds)
+    if not math.isfinite(seconds) or seconds < 0.0:
+        raise ValueError("snapshot I/O duration must be finite and nonnegative")
+    ready = json.loads(ready_file.read_text(encoding="utf-8"))
+    record_path = ready_file.parent / "snapshot.timing.json"
+    atomic_write_json(
+        record_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "checkpoint_sequence": int(ready["checkpoint_sequence"]),
+            "checkpoint_sha256": ready["checkpoint_sha256"],
+            "checkpoint_log_io_seconds": seconds,
+        },
+    )
+    marker = {
+        "sha256": sha256_file(record_path),
+        "size_bytes": record_path.stat().st_size,
+    }
+    atomic_write_json(
+        record_path.with_suffix(record_path.suffix + ".commit.json"), marker
+    )
+    return record_path
+
+
+def _verified_snapshot_timing(ready_path: Path, ready: Mapping[str, Any]) -> dict[str, Any]:
+    """Read one checksum-verified snapshot timing record without changing files.
+
+    Inputs are a snapshot ready path and its parsed identity. The returned
+    mapping contains the matching sequence, checkpoint hash, and elapsed seconds.
+    Missing, corrupt, nonfinite, or mismatched records raise so callers can skip
+    that recovery point rather than treating its timing as complete.
+    """
+
+    record_path = ready_path.parent / "snapshot.timing.json"
+    marker_path = record_path.with_suffix(record_path.suffix + ".commit.json")
+    if not record_path.is_file() or not marker_path.is_file():
+        raise ValueError("snapshot timing record is not committed")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    if (
+        sha256_file(record_path) != marker.get("sha256")
+        or record_path.stat().st_size != int(marker.get("size_bytes", -1))
+    ):
+        raise ValueError("snapshot timing record checksum mismatch")
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    seconds = float(record.get("checkpoint_log_io_seconds", -1.0))
+    if (
+        record.get("schema_version") != SCHEMA_VERSION
+        or int(record.get("checkpoint_sequence", -1)) != int(ready["checkpoint_sequence"])
+        or record.get("checkpoint_sha256") != ready["checkpoint_sha256"]
+        or not math.isfinite(seconds)
+        or seconds < 0.0
+    ):
+        raise ValueError("snapshot timing identity is invalid")
+    return record
+
+
+def verify_resume_snapshot_execution(
+    persistence_directory: str | os.PathLike[str],
+    expected_execution_fingerprint: str | None = None,
+    *,
+    current_config: RunConfig | None = None,
+    current_environment: Mapping[str, Any] | None = None,
+    policy: str = STRICT_RESUME_POLICY,
+) -> dict[str, Any]:
+    """Fail early when a persisted run can resume under the selected policy.
+
+    Inputs are one run's persistence directory and the fingerprint resolved from
+    an exact fingerprint, or current config/environment with a versioned policy.
+    The newest fully timed snapshot manifest is verified and returned with its
+    compatibility report. A corrupt identity or disallowed difference raises
+    before dependent recovery artifacts are copied. The legacy positional form
+    remains strict and cannot enable cross-GPU recovery.
+    """
+
+    remote = Path(persistence_directory)
+    for ready_path in sorted(
+        (remote / "snapshots").glob("checkpoint_*/snapshot.ready.json"),
+        reverse=True,
+    ):
+        try:
+            ready = json.loads(ready_path.read_text(encoding="utf-8"))
+            try:
+                _verified_snapshot_timing(ready_path, ready)
+            except ValueError:
+                continue
+            manifest_path = ready_path.parent / "manifest.json"
+            marker_path = manifest_path.with_suffix(manifest_path.suffix + ".commit.json")
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if (
+                sha256_file(manifest_path) != marker.get("sha256")
+                or manifest_path.stat().st_size != int(marker.get("size_bytes", -1))
+            ):
+                continue
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            observed = manifest.get("execution_fingerprint")
+            if current_config is None or current_environment is None:
+                if expected_execution_fingerprint is None:
+                    raise ValueError("strict snapshot verification requires an execution fingerprint")
+                if observed != expected_execution_fingerprint:
+                    raise ValueError(
+                        "strict resume execution fingerprint differs; the physical GPU UUID "
+                        "and complete saved execution environment must match"
+                    )
+                return manifest
+            saved_values = manifest.get("resolved_config")
+            saved_environment = manifest.get("current_environment", manifest.get("environment"))
+            if not isinstance(saved_values, Mapping) or not isinstance(saved_environment, Mapping):
+                raise ValueError("snapshot lacks saved config/environment compatibility evidence")
+            saved_config = RunConfig(copy.deepcopy(saved_values))
+            report = resume_compatibility_report(
+                saved_config, saved_environment, current_config, current_environment, policy
+            )
+            recorded_current = manifest.get("current_execution_fingerprint", observed)
+            if report["saved_execution_fingerprint"] != recorded_current:
+                raise ValueError("snapshot saved execution fingerprint does not match its environment")
+            manifest = dict(manifest)
+            manifest["resume_compatibility"] = report
+            return manifest
+        except FileNotFoundError:
+            continue
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    raise RuntimeError("No verified compatible recovery snapshot found")
+
+
+def restore_resume_snapshot(
+    persistence_directory: str | os.PathLike[str],
+    run_directory: str | os.PathLike[str],
+) -> Path:
+    """Restore the newest completely verified recovery snapshot.
+
+    Only snapshots with a ready marker and matching file/checkpoint hashes are
+    eligible. Restores into a fresh local directory. Never overwrites a run.
+    """
+
+    remote = Path(persistence_directory)
+    local = Path(run_directory)
+
+    if local.exists():
+        raise FileExistsError(
+            f"Recovery destination must not exist: {local}"
+        )
+
+    candidates = sorted(
+        (remote / "snapshots").glob(
+            "checkpoint_*/snapshot.ready.json"
+        ),
+        reverse=True,
+    )
+
+    selected = None
+
+    for ready_path in candidates:
+        try:
+            ready = json.loads(ready_path.read_text(encoding="utf-8"))
+
+            if (
+                ready["schema_version"] != SCHEMA_VERSION
+                or ready["run_id"] != local.name
+            ):
+                continue
+
+            checkpoint = remote / "checkpoints" / ready["checkpoint_file"]
+            checkpoint_commit = checkpoint.with_suffix(
+                checkpoint.suffix + ".commit.json"
+            )
+
+            if not checkpoint.is_file() or not checkpoint_commit.is_file():
+                continue
+
+            commit = json.loads(
+                checkpoint_commit.read_text(encoding="utf-8")
+            )
+
+            if (
+                sha256_file(checkpoint) != ready["checkpoint_sha256"]
+                or commit["sha256"] != ready["checkpoint_sha256"]
+                or int(commit["checkpoint_sequence"])
+                != int(ready["checkpoint_sequence"])
+                or checkpoint.stat().st_size != int(commit["size_bytes"])
+            ):
+                continue
+
+            timing_record = _verified_snapshot_timing(ready_path, ready)
+
+            for name, identity in ready["files"].items():
+                source = ready_path.parent / name
+                marker = source.with_suffix(
+                    source.suffix + ".commit.json"
+                )
+
+                if not source.is_file() or not marker.is_file():
+                    raise ValueError("Missing recovery support file or marker")
+
+                file_commit = json.loads(
+                    marker.read_text(encoding="utf-8")
+                )
+
+                if (
+                    sha256_file(source) != identity["sha256"]
+                    or source.stat().st_size != identity["size_bytes"]
+                    or file_commit["sha256"] != identity["sha256"]
+                    or file_commit["size_bytes"] != identity["size_bytes"]
+                ):
+                    raise ValueError("Recovery support checksum mismatch")
+
+            selected = (ready, ready_path.parent, checkpoint, timing_record)
+            break
+
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+
+    if selected is None:
+        raise RuntimeError("No completely verified recovery snapshot found")
+
+    ready, snapshot, checkpoint, timing_record = selected
+    staging = local.with_name(f".{local.name}.restore.partial")
+
+    if staging.exists():
+        raise FileExistsError(
+            f"Remove abandoned recovery staging manually: {staging}"
+        )
+
+    staging.mkdir(parents=True)
+
+    try:
+        checkpoint_directory = staging / "checkpoints"
+        checkpoint_directory.mkdir()
+
+        # Restore the plan's resumable/probe retention set, not merely the latest
+        # boundary. This keeps the warm-up transition and post-warm probe points
+        # available after an ephemeral-runtime loss without copying other runs.
+        manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+        training = manifest["resolved_config"]["scientific"]["training"]
+        warmup_epochs = int(training["warmup_epochs"])
+        total_epochs = int(training["total_epochs"])
+        latest_sequence = int(ready["checkpoint_sequence"])
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        retained_sequences = {1, latest_sequence, max(1, latest_sequence - 1), warmup_epochs}
+        retained_sequences.update(
+            warmup_epochs + offset
+            for offset in (1, 6, 12)
+            if warmup_epochs + offset <= total_epochs
+        )
+        retained_sequences.update(
+            int(record["checkpoint_sequence"])
+            for record in payload["run_state"].get("target_attainment", {}).values()
+            if record.get("reached") is True
+        )
+        retained_sequences = {
+            sequence for sequence in retained_sequences
+            if 1 <= sequence <= latest_sequence
+        }
+
+        for sequence in sorted(retained_sequences):
+            source = remote / "checkpoints" / f"checkpoint_{sequence:06d}.pt"
+            source_commit = source.with_suffix(source.suffix + ".commit.json")
+            if not source.is_file() or not source_commit.is_file():
+                raise ValueError(f"required retained checkpoint is missing: {sequence}")
+            commit = json.loads(source_commit.read_text(encoding="utf-8"))
+            if (
+                int(commit.get("checkpoint_sequence", -1)) != sequence
+                or sha256_file(source) != commit.get("sha256")
+                or source.stat().st_size != int(commit.get("size_bytes", -1))
+            ):
+                raise ValueError(f"required retained checkpoint is corrupt: {sequence}")
+            destination = checkpoint_directory / source.name
+            shutil.copyfile(source, destination)
+            shutil.copyfile(
+                source_commit,
+                destination.with_suffix(destination.suffix + ".commit.json"),
+            )
+
+        for name, identity in ready["files"].items():
+            destination = staging / name
+            shutil.copyfile(snapshot / name, destination)
+
+            if sha256_file(destination) != identity["sha256"]:
+                raise IOError(f"Restored file failed checksum: {name}")
+
+        # Snapshot support files were copied before their own persistence cost
+        # was known. The committed timing sidecar supplies that one missing
+        # checkpoint/log I/O record exactly once during recovery.
+        sequence = int(ready["checkpoint_sequence"])
+        seconds = float(timing_record["checkpoint_log_io_seconds"])
+        journal_path = staging / "checkpoint_journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        matching = [
+            row for row in journal["records"]
+            if int(row["checkpoint_sequence"]) == sequence
+        ]
+        if len(matching) != 1:
+            raise ValueError("restored checkpoint journal lacks one current record")
+        matching[0]["io_seconds"] = seconds
+        atomic_write_json(journal_path, journal)
+
+        timing_path = staging / "timing.json"
+        ledger = TimingLedger.from_dict(
+            json.loads(timing_path.read_text(encoding="utf-8"))
+        )
+        if any(int(row["checkpoint_sequence"]) == sequence for row in ledger.checkpoint_io):
+            raise ValueError("restored timing already contains current snapshot I/O")
+        ledger.add("checkpoint_log_io", seconds)
+        ledger.checkpoint_io.append(
+            {
+                "checkpoint_sequence": sequence,
+                "sha256": ready["checkpoint_sha256"],
+                "io_seconds": seconds,
+                "verified_persistence_copy": str(checkpoint),
+            }
+        )
+        atomic_write_json(timing_path, ledger.to_dict())
+
+        local.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, local)
+
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    return local
+
+
+def restore_or_verify_resume_snapshot(
+    persistence_directory: str | os.PathLike[str],
+    run_directory: str | os.PathLike[str],
+) -> Path:
+    """Restore a run once or verify that an earlier staged restore is identical.
+
+    Inputs identify one persistence directory and intended local run directory.
+    If the destination is absent, the newest complete snapshot is restored and
+    returned. If it exists, the helper verifies the newest timed snapshot, every
+    snapshot file hash, and the local latest committed checkpoint sequence/hash,
+    then reuses it without writing. Missing, partial, advanced, or differing local
+    state raises; valid files are never overwritten and no training/RNG occurs.
+    """
+
+    remote = Path(persistence_directory)
+    local = Path(run_directory)
+    if not local.exists():
+        return restore_resume_snapshot(remote, local)
+    if not local.is_dir():
+        raise ValueError("staged recovery destination is not a directory")
+    candidates = sorted(
+        (remote / "snapshots").glob("checkpoint_*/snapshot.ready.json"), reverse=True
+    )
+    selected: tuple[Path, dict[str, Any], dict[str, Any]] | None = None
+    for ready_path in candidates:
+        try:
+            ready = json.loads(ready_path.read_text(encoding="utf-8"))
+            timing_record = _verified_snapshot_timing(ready_path, ready)
+            selected = (ready_path, ready, timing_record)
+            break
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+    if selected is None:
+        raise RuntimeError("No completely verified recovery snapshot found")
+    ready_path, ready, timing_record = selected
+    for name, identity in ready.get("files", {}).items():
+        path = local / name
+        if name == "timing.json":
+            # Recovery legitimately adds the committed snapshot-copy duration to
+            # the pre-I/O ledger, so its bytes differ from the snapshot source.
+            # Validate the transformed ledger structurally instead of pretending
+            # that the recovery accounting did not occur.
+            TimingLedger.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            continue
+        if name == "checkpoint_journal.json":
+            journal = json.loads(path.read_text(encoding="utf-8"))
+            matching = [
+                row for row in journal.get("records", [])
+                if int(row.get("checkpoint_sequence", -1))
+                == int(ready["checkpoint_sequence"])
+            ]
+            if (
+                len(matching) != 1
+                or float(matching[0].get("io_seconds", -1.0))
+                != float(timing_record["checkpoint_log_io_seconds"])
+            ):
+                raise ValueError("existing staged recovery journal timing differs")
+            continue
+        if (
+            not path.is_file()
+            or sha256_file(path) != identity.get("sha256")
+            or path.stat().st_size != int(identity.get("size_bytes", -1))
+        ):
+            raise ValueError(f"existing staged recovery file differs: {name}")
+    checkpoint = latest_committed_checkpoint(local / "checkpoints")
+    commit = json.loads(
+        checkpoint.with_suffix(checkpoint.suffix + ".commit.json").read_text(encoding="utf-8")
+    )
+    if (
+        int(commit.get("checkpoint_sequence", -1)) != int(ready["checkpoint_sequence"])
+        or commit.get("sha256") != ready.get("checkpoint_sha256")
+        or sha256_file(checkpoint) != ready.get("checkpoint_sha256")
+    ):
+        raise ValueError("existing staged recovery checkpoint differs from verified snapshot")
+    return local
+
