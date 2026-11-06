@@ -139,10 +139,7 @@ class NotebookReadinessTests(unittest.TestCase):
             continuation_namespace = {
                 **namespace,
                 "RECOVERY_COMPATIBILITY": "strict_execution",
-                "RESTORE_RUN_ID": "run",
-                "persistence_arguments": lambda _run_id: [],
-                "method": "exact",
-                "source_methods": set(),
+                "run_measured_batch": mock.Mock(),
             }
             with self.assertRaisesRegex(PermissionError, "default-disabled"):
                 exec(continuation_source, continuation_namespace)
@@ -152,7 +149,9 @@ class NotebookReadinessTests(unittest.TestCase):
             )
             with mock.patch("torchvision.datasets.CIFAR10", return_value=object()):
                 exec(enabled, continuation_namespace)
-            self.assertTrue(any("resume" in command for command in commands))
+            continuation_namespace["run_measured_batch"].assert_called_once_with(
+                authorized=True, policy="strict_execution",
+            )
 
 
 class PersistenceReadinessTests(unittest.TestCase):

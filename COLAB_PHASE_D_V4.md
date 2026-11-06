@@ -232,7 +232,7 @@ separate full-pilot approval. The essential sequence is repeated below.
 A Git clone intentionally excludes `cifar_d_resnet_v3/`. Before cells 3–4,
 upload the existing `cifar_d_resnet_v3.zip` into the repository root, alongside
 `AGENTS.md`. Its required SHA-256 is
-`469dbc42283afe1ace2c8fe29dbdebcee3b22ff6092358ec503b2cdb2920e127`, size
+`fd52ed7f6332d7ad7f5ad7ff913980f64169d6cba2aed9d8cfe3d1f46c81ea22`, size
 998,800,703 bytes, and its only top-level extraction root is
 `cifar_d_resnet_v3/`. The notebook verifies the archive and safe member layout,
 extracts it only when the results directory is absent, then verifies the
@@ -372,11 +372,17 @@ with `make-config`; source-derived methods require both donor `masks.npz` and
 `mask_manifest.json`, gap permutation also requires `--mask-replicate 0`, and
 fixed frontloaded uses `--synthetic-behavior learned` without donor artifacts.
 
-Run learned replay equivalence and require `analyze_phase_d_v4.py compare-replay`
-to prove final classifier, predictor, optimizer, masks, counters, and data-order
-state. Then execute the eleven measured trajectories one at a time; the notebook
-derives the next unfinished run from the saved order rather than accepting an
-arbitrary default. After the fresh measured feedback run, require:
+Run the notebook's learned replay equivalence check to prove final classifier,
+predictor, optimizer, masks, counters, and data-order equality. Its checker reads
+the actual flat checkpoint counters; the older CLI incorrectly expects a nested
+`counters` object. The notebook correction leaves fingerprinted analysis/training
+source files unchanged so previously saved runs can still resume.
+
+Execute the cell beginning `Run all remaining measured conditions in the frozen
+order` once. It runs all eleven conditions sequentially in the saved order,
+verifies and skips completed runs, and resumes the first partial condition.
+It stops on any failure without retrying or proceeding to later conditions.
+After the fresh measured feedback run, it requires:
 
 ```bash
 python -B analyze_phase_d_v4.py compare-feedback-masks \
@@ -389,8 +395,11 @@ outcomes.
 
 ### 7. Persistence and recovery
 
-Keep active training under `/content`. Mount Drive only when the user chooses to
-persist. Set the notebook's `PERSISTENCE_ROOT`; it passes `--persistence-dir` so
+Keep active training under `/content`. The first notebook cell mounts Drive and
+clones the original pinned GitHub commit if the local checkout is absent. It
+reuses `phase_d_v4_uploads/colab_recovery_check_01_commit.txt` when present.
+The persistence cell defaults to `/content/drive/MyDrive/phase_d_v4_pilot_seed0`;
+use the original study folder, never a new one during recovery. It passes `--persistence-dir` so
 each locally committed epoch checkpoint is copied, SHA-256 verified, and given
 its `.commit.json` marker last. Copy time remains in checkpoint/log I/O. Ignore
 `.partial`, missing-marker, or mismatched remote files. This workflow is tested
@@ -412,6 +421,51 @@ cell 14 performs only verified restoration, cell 15 owns the separate
 `AUTHORIZE_RECOVERY_DATA_SETUP=False` gate, and cell 16 owns the independent
 `AUTHORIZE_RECOVERY_CONTINUATION=False` gate. Each cell can be run later without
 repeating or deleting a valid earlier stage.
+
+#### Exact workflow after losing the runtime during the measured loop
+
+Open the updated `PHASE_D_V4_COLAB.ipynb` in Colab and select a T4. No additional
+helper cells, manual interrupted-run ID, or training-source replacements are
+needed. Run these existing cells in order:
+
+1. `from pathlib import Path` / environment setup: mounts Drive, recreates the
+   pinned checkout, copies the historical ZIP, restores only the exact audited
+   specification line endings, and supplies the missing test package marker.
+2. `# Optional Drive persistence. Active training always stays under /content.`:
+   sets the original Drive path and defines batch helpers; does not train.
+3. `# A Git clone omits the historical results.`: verifies the historical files.
+   The known alternate ZIP packaging hash is accepted only for the exact archive
+   whose 44 contained files were independently verified against the frozen tree.
+4. `run_checked(['run_phase_d_v4_tests.py'])`: tests and CUDA audit must pass.
+5. `Restore the entire measured batch after a Colab runtime reset`: explicitly
+   choose `RECOVERY_COMPATIBILITY = COMPATIBLE_T4_RESUME_POLICY` for a replacement
+   T4, then run once. This restores every completed condition as well as the
+   interrupted condition, both completed dependencies, all configs and the
+   original split/order/pre-block profile. It prints each status automatically.
+6. `Optionally reconstruct the ephemeral dataset cache after restoration`: set
+   `AUTHORIZE_RECOVERY_DATA_SETUP = True` and run. Split identity must match.
+7. `Continue the restored batch through all remaining conditions`: set
+   `AUTHORIZE_RECOVERY_CONTINUATION = True` and run once. It resumes the partial
+   run and starts the remaining conditions without further manual execution.
+
+Do not run the fresh-study split setup, warm-ups, donor or replay cells again.
+Repeat this same recovery sequence after another VM loss. Restoring an unchanged
+snapshot twice is safe. A missing/corrupt backup, incompatible source/environment,
+out-of-order completion, or recorded failed command stops the batch. A run that
+started but lost its first epoch before any checkpoint needs review; it is not
+silently restarted. `_batch_status` records starts/failures on Drive. Never delete
+a failure marker simply to force a retry.
+
+On Windows only, a transient permission failure while atomically publishing a
+restored directory may retry restoration up to three times, and only while the
+destination is absent. Every attempt re-verifies the snapshot. This does not
+retry training, checksum errors, or a conflicting existing run.
+
+Batch restoration duration is saved separately under `batch_recovery` and backed
+up with study support. No downtime is invented. After recovery, final validation
+reports that the original single-session drift comparison is unavailable; it does
+not regenerate the old profile or claim a clean efficiency benchmark. Existing
+per-run cross-device continuation checks and timing exclusions remain unchanged.
 
 
 ### Verified epoch recovery snapshots

@@ -23,7 +23,7 @@
   },
   "reference_results_archive": {
     "path": "cifar_d_resnet_v3.zip",
-    "sha256": "469dbc42283afe1ace2c8fe29dbdebcee3b22ff6092358ec503b2cdb2920e127",
+    "sha256": "fd52ed7f6332d7ad7f5ad7ff913980f64169d6cba2aed9d8cfe3d1f46c81ea22",
     "size_bytes": 998800703,
     "required_top_level": "cifar_d_resnet_v3/"
   },

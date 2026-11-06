@@ -17,6 +17,17 @@ env/
 # Datasets
 /data/
 /datasets/
+_dataset_cache/
+cifar-10-batches-py/
+
+# Downloaded datasets and result bundles (keep these on Drive/local storage)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.7z
+*.rar
 
 # Experimental results
 /cifar_d_resnet_v3/
@@ -24,11 +35,26 @@ env/
 /runs/
 /outputs/
 
+# Historical outputs: retain archived source and explanatory documents
+/archive/*
+!/archive/*.py
+!/archive/*.md
+
+# Downloaded reference papers and local notebook repair workspace
+/research/papers/
+/.single_cell_fix/
+
 # Model checkpoints
 *.pt
 *.pth
 *.ckpt
 *.safetensors
+*.pt.commit.json
+*.pth.commit.json
+*.npy
+*.npz
+checkpoints/
+snapshots/
 
 # Temporary files
 *.tmp
@@ -48,5 +74,3 @@ Thumbs.db
 !.env.example
 credentials.json
 *.pem
-
-/archive//cifar_d_resnet_v3.zip

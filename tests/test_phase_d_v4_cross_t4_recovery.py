@@ -207,19 +207,21 @@ class CompatibilityPolicyTests(unittest.TestCase):
         code = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
         for index, source in enumerate(code):
             compile(source, f"recovery_notebook_cell_{index}", "exec")
-        recovery = next(source for source in code if "RESTORE_RUN_ID" in source)
+        recovery = next(source for source in code if source.startswith('"""Restore the entire measured batch'))
+        helpers = next(source for source in code if 'def restore_measured_batch(' in source)
         self.assertIn("RECOVERY_COMPATIBILITY = STRICT_RESUME_POLICY", recovery)
         self.assertIn("COMPATIBLE_T4_RESUME_POLICY", recovery)
         self.assertLess(
-            recovery.index("verify_resume_snapshot_execution("),
-            recovery.index("restore_or_verify_resume_snapshot("),
+            helpers.index("verify_resume_snapshot_execution("),
+            helpers.index("restore_or_verify_resume_snapshot("),
         )
         self.assertNotIn("probe_checkpoint_continuation(", recovery)
         dataset_stage = next(source for source in code if "AUTHORIZE_RECOVERY_DATA_SETUP" in source)
         continuation_stage = next(source for source in code if "AUTHORIZE_RECOVERY_CONTINUATION" in source)
         self.assertIn("AUTHORIZE_RECOVERY_DATA_SETUP = False", dataset_stage)
         self.assertIn("AUTHORIZE_RECOVERY_CONTINUATION = False", continuation_stage)
-        self.assertIn("'--resume-compatibility',RECOVERY_COMPATIBILITY", continuation_stage)
+        self.assertIn("policy=RECOVERY_COMPATIBILITY", continuation_stage)
+        self.assertIn("'--resume-compatibility', policy", helpers)
         joined = "\n".join(code)
         self.assertIn("AUTHORIZE_REAL_DATA_PREFLIGHT = False", joined)
         self.assertIn("AUTHORIZE_FULL_PILOT = False", joined)
